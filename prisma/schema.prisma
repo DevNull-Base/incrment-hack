@@ -1,0 +1,1579 @@
+// ============================================================================
+//  CRM «ИТ Школа РТК» — схема базы данных
+//
+//  Соглашения:
+//   • Таблицы и колонки в snake_case (@@map / @map) — конвенция PostgreSQL.
+//   • Доменные сущности используют UUID: это позволяет формировать
+//     идемпотентные ключи при импорте и синхронизации, не обращаясь к БД.
+//   • Журнальные таблицы (аудит, переходы) используют BigInt autoincrement:
+//     они растут быстро, и последовательный ключ дружелюбнее к индексам.
+//   • Секционирование журналов по месяцам и materialized views описаны
+//     отдельной SQL-миграцией — Prisma их не выражает.
+// ============================================================================
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+// В Prisma 7 строка подключения задаётся не здесь, а в prisma.config.ts
+// (для миграций) и через драйверный адаптер PrismaPg (для рантайма).
+datasource db {
+  provider = "postgresql"
+}
+
+// ===========================================================================
+//  ПОЛЬЗОВАТЕЛИ И ДОСТУП
+// ===========================================================================
+
+/// Роли системы согласно ТЗ (раздел «Реализация ролевой модели»).
+enum UserRole {
+  /// КАМ — менеджер по вузам. Работает в пределах своей выборки данных.
+  USER
+  /// Руководитель. Видит данные подчинённых, может менять ответственных за вузы.
+  MANAGER
+  /// Администратор платформы. Управление правами и настройками.
+  ADMIN
+}
+
+/// Пользователь системы. Источник истины по учётным записям — Keycloak;
+/// здесь хранится локальная проекция и доменные атрибуты (роль, подчинённость).
+model AppUser {
+  id           String   @id @default(uuid()) @db.Uuid
+  /// `sub` из JWT Keycloak — связь с внешним провайдером идентификации.
+  keycloakSub  String   @unique @map("keycloak_sub")
+  email        String   @unique
+  displayName  String   @map("display_name")
+  role         UserRole @default(USER)
+  /// Роль назначена администратором в CRM и больше не синхронизируется из
+  /// токена. Без этого признака смена роли откатывалась на первом же запросе
+  /// пользователя: сброс кэша профиля заставлял заново прочитать роль из
+  /// Keycloak, и понизить права через систему было невозможно.
+  roleManagedLocally Boolean @default(false) @map("role_managed_locally")
+  isActive     Boolean  @default(true) @map("is_active")
+  /// Руководитель пользователя — задаёт иерархию видимости данных.
+  managerId    String?  @map("manager_id") @db.Uuid
+  manager      AppUser? @relation("UserHierarchy", fields: [managerId], references: [id], onDelete: SetNull)
+  subordinates AppUser[] @relation("UserHierarchy")
+
+  lastLoginAt DateTime? @map("last_login_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  ownedEngagements Engagement[]     @relation("EngagementOwner")
+  scopeRules       DataScopeRule[]
+  transitions      WorkflowTransition[]
+  comments         Comment[]
+  attachments      Attachment[]
+  importJobs       ImportJob[]
+  reportJobs       ReportJob[]
+  reportDefs       ReportDefinition[]
+  workspaceStates  UserWorkspaceState[]
+  drafts           UserDraft[]
+  recentItems      UserRecentItem[]
+  notifications    Notification[]
+  engagementNotes  EngagementNote[]
+  interestRatings  Engagement[]     @relation("EngagementInterestAuthor")
+  archivedEngagements Engagement[]  @relation("EngagementArchivedBy")
+  activityEvents   ActivityEvent[]
+  ownedTasks       PlannerTask[]    @relation("TaskOwner")
+  assignedTasks    PlannerTask[]    @relation("TaskCreator")
+  universityNotes  UniversityNote[]
+  createdMeetings  EngagementMeeting[]
+
+  @@index([role, isActive])
+  @@index([managerId])
+  @@map("app_user")
+}
+
+/// Измерение, по которому администратор ограничивает видимость данных.
+enum ScopeDimension {
+  UNIVERSITY
+  IT_DIRECTION
+  SOFTWARE_PRODUCT
+  REGION
+}
+
+/// Правило ограничения выборки данных для пользователя.
+/// Требование ТЗ: администратор выполняет «разграничение пользователей
+/// по доступу к данным». Пустой набор правил по измерению = доступ ко всему.
+model DataScopeRule {
+  id        String         @id @default(uuid()) @db.Uuid
+  userId    String         @map("user_id") @db.Uuid
+  user      AppUser        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  dimension ScopeDimension
+  /// Разрешённые значения измерения.
+  ///
+  /// Тип text[], а не uuid[]: измерение REGION хранит НАЗВАНИЯ регионов,
+  /// а не идентификаторы (у регионов нет собственной таблицы). При uuid[]
+  /// правило по региону не записалось бы вовсе — PostgreSQL отверг бы
+  /// значение, и ограничение видимости по региону просто не работало бы.
+  allowedIds String[]      @map("allowed_ids")
+  createdAt DateTime       @default(now()) @map("created_at")
+
+  @@unique([userId, dimension])
+  @@index([userId])
+  @@map("data_scope_rule")
+}
+
+// ===========================================================================
+//  КАТАЛОГИ
+// ===========================================================================
+
+/// Вуз или школа. Поле ТЗ: «Название ВУЗа».
+model University {
+  id        String  @id @default(uuid()) @db.Uuid
+  name      String
+  shortName String? @map("short_name")
+  /// Нормализованное имя (нижний регистр, без пунктуации и кавычек).
+  /// Используется вместе с pg_trgm для поиска дубликатов при импорте:
+  /// «МГТУ им. Баумана» и полное наименование должны схлопываться в один вуз.
+  normalizedName String @map("normalized_name")
+  inn       String? @db.VarChar(12)
+  region    String?
+  city      String?
+  website   String?
+  isActive  Boolean @default(true) @map("is_active")
+
+  /// Идентификатор во внешней системе (LMS/сайт) для идемпотентной синхронизации.
+  externalId String? @map("external_id")
+  externalSource String? @map("external_source")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  engagements Engagement[]
+  contracts   Contract[]
+  contacts    UniversityContact[]
+  streams     LearningStream[]
+  notes       UniversityNote[]
+
+  @@unique([externalSource, externalId])
+  @@index([normalizedName])
+  @@index([isActive])
+  @@index([region])
+  @@map("university")
+}
+
+/// Заметка по вузу целиком — то, что не относится ни к одной заявке:
+/// «ректор сменился», «закупки только через площадку». Прежде такие записи
+/// жили в браузере менеджера и пропадали вместе с ним.
+model UniversityNote {
+  id           String     @id @default(uuid()) @db.Uuid
+  universityId String     @map("university_id") @db.Uuid
+  university   University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+
+  authorId String  @map("author_id") @db.Uuid
+  author   AppUser @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  body     String
+  isPinned Boolean @default(false) @map("is_pinned")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  editedAt  DateTime? @map("edited_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([universityId, deletedAt, createdAt])
+  @@map("university_note")
+}
+
+/// Производитель ПО. Поле ТЗ: «Вендор».
+model Vendor {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  products SoftwareProduct[]
+  contacts VendorContact[]
+
+  @@map("vendor")
+}
+
+/// Способ связи с контактным лицом.
+enum ContactChannel {
+  EMAIL
+  PHONE
+  TELEGRAM
+  MAX
+}
+
+/// Контактное лицо вендора.
+///
+/// Каталог вендоров, переданный заказчиком, — это прежде всего люди:
+/// кому писать по продукту и как — почтой или в чате Telegram. Модель
+/// хранила только название вендора, и контакты жили бы в личных записях
+/// менеджеров, уходя вместе с ними.
+///
+/// Сами персональные данные — в Person, где для них заведены правовое
+/// основание, срок хранения и обезличивание; здесь только связь и то,
+/// что относится к роли человека у вендора.
+model VendorContact {
+  id       String @id @default(uuid()) @db.Uuid
+  vendorId String @map("vendor_id") @db.Uuid
+  vendor   Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  personId String @map("person_id") @db.Uuid
+  person   Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  /// Предпочтительные способы связи — в порядке, указанном в источнике.
+  channels  ContactChannel[] @default([])
+  /// Продукты, по которым к человеку обращаться; пусто — по всем.
+  products  String[]         @default([])
+  isPrimary Boolean          @default(false) @map("is_primary")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([vendorId, personId])
+  @@index([vendorId])
+  @@map("vendor_contact")
+}
+
+/// ИТ-продукт (ПО). Поле ТЗ: «ПО».
+model SoftwareProduct {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  vendorId    String   @map("vendor_id") @db.Uuid
+  vendor      Vendor   @relation(fields: [vendorId], references: [id], onDelete: Restrict)
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  engagements Engagement[]
+  licenses    License[]
+  programs    ItProgram[]
+
+  @@unique([vendorId, name])
+  @@index([isActive])
+  @@map("software_product")
+}
+
+/// ИТ-направление обучения: DevOps, QA и т.д.
+model ItDirection {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @unique
+  code      String?  @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  programs    ItProgram[]
+  engagements Engagement[]
+
+  @@map("it_direction")
+}
+
+/// ИТ-программа: методические материалы и практика по направлению.
+model ItProgram {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  directionId String   @map("direction_id") @db.Uuid
+  direction   ItDirection @relation(fields: [directionId], references: [id], onDelete: Restrict)
+  /// Продукт, вокруг которого построена программа (может отсутствовать).
+  productId   String?  @map("product_id") @db.Uuid
+  product     SoftwareProduct? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  hoursTotal  Int?     @map("hours_total")
+  isActive    Boolean  @default(true) @map("is_active")
+
+  /// Образовательный проект, через который программа предлагается.
+  source           EducationProject @default(RTK_SCHOOL)
+  /// Карточка программы в каталоге курсов: что это, для кого, что нужно.
+  description      String?
+  audience         String?
+  audienceCategory ProgramAudience  @default(SPECIALISTS) @map("audience_category")
+  requirements     String?
+
+  externalId     String? @map("external_id")
+  externalSource String? @map("external_source")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  engagements Engagement[]
+  streams     LearningStream[]
+
+  @@unique([directionId, name])
+  @@unique([externalSource, externalId])
+  @@index([isActive])
+  @@index([source])
+  @@map("it_program")
+}
+
+/// Образовательный проект — сайт, через который программа или процесс
+/// приходят к обучающимся: ИТ Школа РТК, коммерческие программы edu-rt,
+/// федеральный проект sz-rt, корпоративное обучение edupro.
+enum EducationProject {
+  RTK_SCHOOL
+  EDU_RT
+  SZ_RT
+  EDUPRO
+}
+
+/// Для кого программа — фильтр каталога курсов.
+enum ProgramAudience {
+  /// Частные лица.
+  INDIVIDUALS
+  /// Специалисты и сотрудники организаций.
+  SPECIALISTS
+  /// Участники государственного проекта.
+  STATE_PROJECT
+}
+
+/// Состояние учебного потока.
+enum StreamStatus {
+  PLANNED
+  ACTIVE
+  COMPLETED
+  PAUSED
+}
+
+/// Учебный поток — группа, которая проходит программу с конкретной даты.
+///
+/// ТЗ ранжирует программы по востребованности: заявки, число обучающихся
+/// и число параллельных потоков. Первое дают заявки, остальное — потоки:
+/// сколько групп идёт одновременно и сколько в них людей. Поток при вузе —
+/// обучение в рамках взаимодействия с вузом; поток без вуза — набор
+/// прямых продаж на сайте.
+model LearningStream {
+  id        String    @id @default(uuid()) @db.Uuid
+  programId String    @map("program_id") @db.Uuid
+  program   ItProgram @relation(fields: [programId], references: [id], onDelete: Restrict)
+
+  universityId String?     @map("university_id") @db.Uuid
+  university   University? @relation(fields: [universityId], references: [id], onDelete: Restrict)
+
+  /// Подпись потока, как его называют в LMS: «Осень-2026», «Поток 3».
+  name          String?
+  startDate     DateTime     @map("start_date") @db.Date
+  endDate       DateTime?    @map("end_date") @db.Date
+  studentsCount Int          @default(0) @map("students_count")
+  status        StreamStatus @default(PLANNED)
+
+  /// Идентификатор потока в LMS — для идемпотентной синхронизации.
+  externalId     String? @map("external_id")
+  externalSource String? @map("external_source")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([externalSource, externalId])
+  @@index([programId, status])
+  @@index([universityId])
+  @@index([startDate])
+  @@map("learning_stream")
+}
+
+// ===========================================================================
+//  ПЕРСОНЫ (ЗОНА ПЕРСОНАЛЬНЫХ ДАННЫХ)
+// ===========================================================================
+
+/// Правовое основание обработки персональных данных (ст. 6 152-ФЗ).
+/// Фиксируется для каждого субъекта: без указанного основания обработка
+/// неправомерна, а при проверке оператор обязан его предъявить.
+enum PdLawfulBasis {
+  /// п. 5 ч. 1 ст. 6 — исполнение договора с вузом.
+  CONTRACT
+  /// п. 1 ч. 1 ст. 6 — согласие субъекта.
+  CONSENT
+  /// п. 2 ч. 1 ст. 6 — исполнение возложенных законом обязанностей.
+  LEGAL_OBLIGATION
+  /// Основание не определено: запись создана импортом и подлежит разбору.
+  /// Служит рабочим признаком незавершённой инвентаризации, а не основанием.
+  UNDEFINED
+}
+
+/// Физическое лицо: менеджер Школы или ответственный от вуза.
+///
+/// ВНИМАНИЕ: таблица содержит персональные данные (152-ФЗ).
+/// Состав полей минимизирован до необходимого для рабочих коммуникаций.
+/// Значения маскируются в логах, доступ протоколируется в audit_log
+/// действием VIEW_PERSONAL_DATA (см. PersonalDataInterceptor).
+model Person {
+  id         String  @id @default(uuid()) @db.Uuid
+  /// Поле ТЗ: «ФИО Менеджера» / «Ответственные от ВУЗа».
+  fullName   String  @map("full_name")
+  email      String?
+  phone      String?
+  position   String?
+  /// Связь с учётной записью, если персона — сотрудник Школы.
+  appUserId  String? @unique @map("app_user_id") @db.Uuid
+
+  /// Правовое основание обработки. Записи, созданные импортом, получают
+  /// UNDEFINED: основание проставляет ответственный за обработку ПДн.
+  lawfulBasis PdLawfulBasis @default(UNDEFINED) @map("lawful_basis")
+
+  /// Дата, после которой запись подлежит обезличиванию (ограничение срока
+  /// хранения ПДн по достижении цели обработки, ч. 7 ст. 5 152-ФЗ).
+  /// Обрабатывается регламентной задачей RetentionService.
+  retentionUntil DateTime? @map("retention_until")
+
+  /// Момент обезличивания. Заполнен — значит персональные данные удалены
+  /// по требованию субъекта (ч. 4 ст. 21) либо по истечении срока хранения,
+  /// а строка сохранена лишь как обезличенная ссылка для целостности истории.
+  erasedAt DateTime? @map("erased_at")
+  /// Основание обезличивания: требование субъекта, истечение срока, решение
+  /// оператора. Нужно при составлении акта об уничтожении ПДн.
+  erasureReason String? @map("erasure_reason")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  universityContacts UniversityContact[]
+  /// Заявки, где персона указана контактным лицом контрагента (B2C).
+  counterpartyEngagements Engagement[] @relation("EngagementCounterparty")
+  vendorContacts          VendorContact[]
+
+  @@index([fullName])
+  @@index([retentionUntil])
+  @@index([erasedAt])
+  /// Поиск того же человека при приёме оплат и загрузке списков: по почте
+  /// и по телефону в нормализованном виде +7XXXXXXXXXX.
+  @@index([email])
+  @@index([phone])
+  @@map("person")
+}
+
+/// Ответственный от вуза. Поле ТЗ: «Ответственные от ВУЗа».
+model UniversityContact {
+  id           String     @id @default(uuid()) @db.Uuid
+  universityId String     @map("university_id") @db.Uuid
+  university   University @relation(fields: [universityId], references: [id], onDelete: Cascade)
+  personId     String     @map("person_id") @db.Uuid
+  person       Person     @relation(fields: [personId], references: [id], onDelete: Cascade)
+  role         String?
+  isPrimary    Boolean    @default(false) @map("is_primary")
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  @@unique([universityId, personId])
+  @@index([universityId])
+  @@map("university_contact")
+}
+
+// ===========================================================================
+//  ДОГОВОРЫ И ЛИЦЕНЗИИ
+// ===========================================================================
+
+/// Договор с вузом. Поле ТЗ: «Номер договора».
+model Contract {
+  id           String     @id @default(uuid()) @db.Uuid
+  number       String
+  universityId String     @map("university_id") @db.Uuid
+  university   University @relation(fields: [universityId], references: [id], onDelete: Restrict)
+  signedAt     DateTime?  @map("signed_at") @db.Date
+  comment      String?
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  licenses License[]
+
+  @@unique([universityId, number])
+  @@index([signedAt])
+  @@map("contract")
+}
+
+/// Статус передачи лицензии. Поле ТЗ: «Статус по передаче».
+enum LicenseTransferStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  TRANSFERRED
+  REJECTED
+}
+
+/// Лицензия на ИТ-продукт в рамках договора.
+model License {
+  id         String   @id @default(uuid()) @db.Uuid
+  contractId String   @map("contract_id") @db.Uuid
+  contract   Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  productId  String   @map("product_id") @db.Uuid
+  product    SoftwareProduct @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  /// Поле ТЗ: «Подписание лицензии».
+  signedAt   DateTime? @map("signed_at") @db.Date
+  /// Поле ТЗ: «Срок действия лицензии (год)».
+  validYears Int?      @map("valid_years")
+  /// Вычисляемая дата окончания — упрощает выборки «истекает в периоде».
+  validUntil DateTime? @map("valid_until") @db.Date
+
+  transferStatus LicenseTransferStatus @default(NOT_STARTED) @map("transfer_status")
+  comment        String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([contractId])
+  @@index([productId])
+  @@index([validUntil])
+  @@index([transferStatus])
+  @@map("license")
+}
+
+// ===========================================================================
+//  ВЗАИМОДЕЙСТВИЕ (ЦЕНТРАЛЬНАЯ СУЩНОСТЬ)
+// ===========================================================================
+
+/// Взаимодействие с вузом по конкретному направлению и продукту.
+/// Именно эта сущность проходит по workflow из 14 шагов и является
+/// строкой в большинстве отчётов.
+/// Сегмент взаимодействия.
+///
+/// Работа с вузами и прямые продажи обучающимся идут по разным маршрутам
+/// и разным составом участников, поэтому сегмент — свойство самой заявки,
+/// а не признак, выводимый из заполненности полей: по нему выбирается
+/// шаблон процесса и разделяется отчётность.
+enum EngagementSegment {
+  /// Взаимодействие с учебным заведением.
+  B2B
+  /// Прямая работа с обучающимся или сторонней организацией.
+  B2C
+}
+
+/// Тип контрагента по заявке.
+enum CounterpartyType {
+  UNIVERSITY
+  PERSON
+  COMPANY
+}
+
+model Engagement {
+  id String @id @default(uuid()) @db.Uuid
+
+  segment EngagementSegment @default(B2B)
+
+  /// Вуз. Обязателен для B2B и пуст для B2C — это гарантируется
+  /// CHECK-ограничением на уровне таблицы, а не только кодом сервиса:
+  /// заявка без контрагента вообще не должна существовать в базе.
+  universityId String?     @map("university_id") @db.Uuid
+  university   University? @relation(fields: [universityId], references: [id], onDelete: Restrict)
+
+  /// Контрагент B2C: физическое либо юридическое лицо. Наименование
+  /// хранится строкой, а персональные данные контактного лица — только
+  /// в Person, где для них заведены правовое основание и срок хранения.
+  counterpartyType      CounterpartyType @default(UNIVERSITY) @map("counterparty_type")
+  counterpartyName      String?          @map("counterparty_name")
+  counterpartyContactId String?          @map("counterparty_contact_id") @db.Uuid
+  counterpartyContact   Person?          @relation("EngagementCounterparty", fields: [counterpartyContactId], references: [id], onDelete: SetNull)
+
+  directionId String      @map("direction_id") @db.Uuid
+  direction   ItDirection @relation(fields: [directionId], references: [id], onDelete: Restrict)
+
+  productId String?          @map("product_id") @db.Uuid
+  product   SoftwareProduct? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  programId String?    @map("program_id") @db.Uuid
+  program   ItProgram? @relation(fields: [programId], references: [id], onDelete: SetNull)
+
+  /// Ответственный менеджер (КАМ). Руководитель может переназначить.
+  ownerId String  @map("owner_id") @db.Uuid
+  owner   AppUser @relation("EngagementOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+
+  title String?
+
+  /// Денормализованный текущий статус — копия состояния workflow-экземпляра.
+  /// Дублирование осознанное: позволяет фильтровать и сортировать отчёты
+  /// без join'а к workflow_instance на каждой строке.
+  currentStateKey   String  @map("current_state_key")
+  currentStateLabel String  @map("current_state_label")
+
+  /// Версия для оптимистичной блокировки (заголовки ETag / If-Match).
+  /// Защищает от «потерянного обновления», когда два КАМа меняют статус одновременно.
+  version Int @default(1)
+
+  isArchived Boolean @default(false) @map("is_archived")
+
+  /// Когда, кем и почему заявка отправлена в архив. Архивная заявка доступна
+  /// только для чтения; вернуть её может тот, кому она видна.
+  archivedAt     DateTime? @map("archived_at")
+  archivedById   String?   @map("archived_by_id") @db.Uuid
+  archivedBy     AppUser?  @relation("EngagementArchivedBy", fields: [archivedById], references: [id], onDelete: SetNull)
+  archiveReason  String?   @map("archive_reason")
+
+  /// Идентификатор обращения во внешней системе.
+  ///
+  /// По нему событие LMS или сайта находит УЖЕ ЗАВЕДЁННУЮ заявку вместо
+  /// создания второй: техническое задание требует добавления данных
+  /// «в существующий или новый workflow», и без такого ключа выполнимой
+  /// оставалась только вторая половина требования.
+  externalId     String? @map("external_id")
+  externalSource String? @map("external_source")
+
+  /// Поток обучения, на который записан слушатель прямой продажи. Строкой:
+  /// сайт присылает его числом, но в выгрузках встречается и «2 поток».
+  studyStream String? @map("study_stream")
+
+  /// Оплата подтверждена внешней системой (сайт) либо загрузкой файла оплат.
+  /// По этой отметке слушатель попадает в выгрузку для загрузки в LMS.
+  paymentConfirmedAt DateTime? @map("payment_confirmed_at")
+
+  /// Номер оплаченного заказа на сайте. По нему повторная доставка той же
+  /// оплаты опознаётся и не заводит вторую заявку. Отдельно от externalId:
+  /// заявка могла прийти с сайта обращением со своим номером, а оплата по
+  /// ней — с номером заказа, и терять ни один из ключей нельзя.
+  paymentReference String? @unique @map("payment_reference")
+
+  /// Слушатель передан в LMS выгрузкой. Повторная выгрузка по умолчанию
+  /// его не включает — иначе LMS получила бы дубли учётных записей.
+  lmsExportedAt DateTime? @map("lms_exported_at")
+
+  /// Заинтересованность контрагента в программе — ручная оценка КАМа.
+  ///
+  /// На сессии вопросов и ответов заказчик разрешил вместо формулы
+  /// ранжирования «возможность изменения приоритетов со стороны КАМов
+  /// и администраторов». Оценка ставится на заявку, то есть на пару
+  /// «вуз — программа», и сводится по направлениям, продуктам и программам
+  /// в рейтинг востребованности. Пусто — оценки ещё нет, и это отличается
+  /// от низкой заинтересованности.
+  interestLevel       InterestLevel? @map("interest_level")
+  /// Короткое обоснование оценки: почему вуз заинтересован или нет.
+  interestComment     String?        @map("interest_comment")
+  interestUpdatedAt   DateTime?      @map("interest_updated_at")
+  interestUpdatedById String?        @map("interest_updated_by_id") @db.Uuid
+  interestUpdatedBy   AppUser?       @relation("EngagementInterestAuthor", fields: [interestUpdatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  workflowInstance WorkflowInstance?
+  notes            EngagementNote[]
+  tasks            PlannerTask[]
+  activityEvents   ActivityEvent[]
+  meetings         EngagementMeeting[]
+
+  /// Естественный ключ взаимодействия — защищает от дублей при импорте XLS.
+  /// Для B2C ключ не работает: university_id там пуст, а NULL в Postgres
+  /// не конфликтует с NULL. Это и требуется — прямые продажи одному и тому же
+  /// направлению ведутся многократно.
+  @@unique([universityId, directionId, productId])
+  /// Пара «внешняя система + идентификатор обращения» уникальна: одно
+  /// обращение снаружи соответствует одной заявке.
+  @@unique([externalSource, externalId])
+  @@index([segment, isArchived])
+  @@index([ownerId, isArchived])
+  @@index([universityId, directionId])
+  @@index([currentStateKey])
+  @@index([createdAt])
+  @@index([updatedAt])
+  @@index([interestLevel])
+  @@index([segment, paymentConfirmedAt])
+  @@map("engagement")
+}
+
+/// Заинтересованность контрагента. Порядок значений задаёт сортировку:
+/// в PostgreSQL перечисление сравнивается по порядку объявления.
+enum InterestLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+/// Заметка к заявке или к одному из её этапов.
+///
+/// Требование ТЗ — «добавление комментария в статус» — отдельно от перехода:
+/// до сих пор комментарий можно было оставить только в момент смены статуса,
+/// а пока заявка неделями стоит на одном этапе, писать было некуда.
+///
+/// Связь с заявкой — настоящий внешний ключ, а не полиморфная пара
+/// (entityType, entityId) модели Comment: заметка без заявки не имеет смысла,
+/// и удаление заявки обязано уносить её заметки с собой.
+model EngagementNote {
+  id           String     @id @default(uuid()) @db.Uuid
+  engagementId String     @map("engagement_id") @db.Uuid
+  engagement   Engagement @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+
+  authorId String  @map("author_id") @db.Uuid
+  author   AppUser @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  body String
+
+  /// Этап процесса, к которому относится заметка. Пусто — заметка ко всей
+  /// заявке. Подпись фиксируется на момент записи, как в журнале переходов:
+  /// переименование или удаление статуса не должно менять смысл старой заметки.
+  stateKey   String? @map("state_key")
+  stateLabel String? @map("state_label")
+
+  /// Закреплённые заметки показываются первыми: так в карточке держат
+  /// важное — «ректор в отпуске до марта», «договор только через юротдел».
+  isPinned Boolean @default(false) @map("is_pinned")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  /// Когда автор последний раз правил текст. Пусто — заметку не правили.
+  editedAt  DateTime? @map("edited_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([engagementId, deletedAt, createdAt])
+  @@index([engagementId, stateKey])
+  @@index([authorId, createdAt])
+  @@map("engagement_note")
+}
+
+/// Состояние встречи.
+enum MeetingStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+}
+
+/// Встреча с представителями вуза — третий шаг базового процесса ТЗ.
+///
+/// Участники хранятся ссылками, а не именами: сотрудники — на учётные
+/// записи, представители вуза — на его ответственных. Имена берутся при
+/// чтении, поэтому обезличивание человека в реестре персональных данных
+/// убирает его и из встреч, а не оставляет копию ФИО в протоколе.
+model EngagementMeeting {
+  id           String     @id @default(uuid()) @db.Uuid
+  engagementId String     @map("engagement_id") @db.Uuid
+  engagement   Engagement @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+
+  scheduledAt     DateTime      @map("scheduled_at")
+  durationMinutes Int?          @map("duration_minutes")
+  location        String?
+  agenda          String?
+  /// Итоги встречи: о чём договорились.
+  protocol        String?
+  status          MeetingStatus @default(SCHEDULED)
+
+  /// Сотрудники ИТ Школы (app_user.id).
+  attendeeIds String[] @default([]) @map("attendee_ids") @db.Uuid
+  /// Ответственные от вуза (university_contact.id).
+  contactIds  String[] @default([]) @map("contact_ids") @db.Uuid
+
+  createdById String  @map("created_by_id") @db.Uuid
+  createdBy   AppUser @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([engagementId, scheduledAt])
+  @@index([scheduledAt])
+  @@map("engagement_meeting")
+}
+
+// ===========================================================================
+//  WORKFLOW
+// ===========================================================================
+
+/// Шаблон workflow.
+///
+/// Редакции нумеруются, но НЕ сосуществуют: процесс в каждом сегменте един
+/// для всех, и публикация новой редакции переводит на неё все запущенные
+/// заявки (см. WorkflowService.publish). Прошлые редакции остаются в таблице
+/// как журнал изменений — по нему видно, как выглядела схема раньше, — но
+/// ни один экземпляр на них не ссылается.
+///
+/// История уже пройденных переходов при этом не искажается: подписи статусов
+/// заморожены в самих строках workflow_transition.
+model WorkflowTemplate {
+  id          String  @id @default(uuid()) @db.Uuid
+  /// Стабильный ключ семейства редакций: все редакции одного шаблона делят его.
+  key         String
+  version     Int
+  name        String
+  description String?
+
+  /// Сегмент, для которого действует шаблон. Активный шаблон по умолчанию
+  /// в каждом сегменте ровно один — это гарантируется частичным уникальным
+  /// индексом, заданным в миграции.
+  segment EngagementSegment @default(B2B)
+
+  /// Сайт-источник, для которого собран процесс (sz-rt, edu-rt…). Пусто —
+  /// процесс общий. Сегмент по-прежнему определяет, какие заявки процесс
+  /// ведёт; сайт лишь отличает, например, процесс федерального проекта
+  /// от коммерческого внутри одного сегмента.
+  siteSource EducationProject? @map("site_source")
+
+  /// Определение автомата: состояния, переходы, guard-условия, SLA, роли.
+  /// Валидируется zod-схемой до сохранения (см. модуль workflow).
+  definition Json @db.JsonB
+
+  isActive   Boolean  @default(false) @map("is_active")
+  isDefault  Boolean  @default(false) @map("is_default")
+  publishedAt DateTime? @map("published_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  instances WorkflowInstance[]
+
+  @@unique([key, version])
+  @@index([isActive, isDefault])
+  @@map("workflow_template")
+}
+
+/// Экземпляр workflow, привязанный к взаимодействию.
+model WorkflowInstance {
+  id           String     @id @default(uuid()) @db.Uuid
+  engagementId String     @unique @map("engagement_id") @db.Uuid
+  engagement   Engagement @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+
+  templateId String           @map("template_id") @db.Uuid
+  template   WorkflowTemplate @relation(fields: [templateId], references: [id], onDelete: Restrict)
+
+  currentStateKey String    @map("current_state_key")
+  enteredAt       DateTime  @default(now()) @map("entered_at")
+  /// Срок SLA для текущего состояния — по нему выявляются «застрявшие» процессы.
+  slaDueAt        DateTime? @map("sla_due_at")
+  completedAt     DateTime? @map("completed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  transitions WorkflowTransition[]
+
+  @@index([templateId])
+  @@index([currentStateKey])
+  @@index([slaDueAt])
+  @@map("workflow_instance")
+}
+
+/// Журнал переходов — append-only, никогда не обновляется и не удаляется.
+/// Секционируется по месяцам отдельной SQL-миграцией.
+model WorkflowTransition {
+  id         BigInt           @id @default(autoincrement())
+  instanceId String           @map("instance_id") @db.Uuid
+  instance   WorkflowInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  fromStateKey String? @map("from_state_key")
+  toStateKey   String  @map("to_state_key")
+  /// Подписи состояний на момент перехода — «замораживаются», чтобы
+  /// последующее переименование статуса не исказило историю.
+  fromStateLabel String? @map("from_state_label")
+  toStateLabel   String  @map("to_state_label")
+
+  actorId String  @map("actor_id") @db.Uuid
+  actor   AppUser @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  /// Комментарий пользователя при переходе (требование ТЗ).
+  comment String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([instanceId, createdAt])
+  @@index([createdAt])
+  @@index([actorId])
+  @@map("workflow_transition")
+}
+
+// ===========================================================================
+//  КОММЕНТАРИИ И ВЛОЖЕНИЯ
+// ===========================================================================
+
+/// Тип сущности для полиморфных связей.
+/// Prisma не поддерживает полиморфизм на уровне внешних ключей, поэтому
+/// связь обеспечивается парой (entityType, entityId) с составным индексом.
+/// Целостность поддерживается на уровне сервисного слоя.
+enum AttachableEntity {
+  ENGAGEMENT
+  WORKFLOW_TRANSITION
+  UNIVERSITY
+  CONTRACT
+  IMPORT_JOB
+}
+
+model Comment {
+  id         BigInt           @id @default(autoincrement())
+  entityType AttachableEntity @map("entity_type")
+  entityId   String           @map("entity_id")
+
+  authorId String  @map("author_id") @db.Uuid
+  author   AppUser @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  body String
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([entityType, entityId, createdAt])
+  @@index([authorId])
+  @@map("comment")
+}
+
+/// Результат антивирусной проверки загруженного файла (мера АВЗ, ФСТЭК).
+enum ScanStatus {
+  PENDING
+  CLEAN
+  INFECTED
+  SKIPPED
+  ERROR
+}
+
+/// Вложение. Форматы по ТЗ: png, jpeg, pdf, zip, gzip, rar, doc, docx, xls, xlsx.
+model Attachment {
+  id         String           @id @default(uuid()) @db.Uuid
+  entityType AttachableEntity @map("entity_type")
+  entityId   String           @map("entity_id")
+
+  fileName String @map("file_name")
+  /// Фактический тип, определённый по сигнатуре файла, а не по расширению.
+  mimeType String @map("mime_type")
+  sizeBytes BigInt @map("size_bytes")
+  /// SHA-256 содержимого: дедупликация и контроль целостности.
+  sha256   String
+  /// Ключ объекта в S3/MinIO.
+  storageKey String @map("storage_key")
+
+  scanStatus ScanStatus @default(PENDING) @map("scan_status")
+  scanDetail String?    @map("scan_detail")
+
+  uploadedById String  @map("uploaded_by_id") @db.Uuid
+  uploadedBy   AppUser @relation(fields: [uploadedById], references: [id], onDelete: Restrict)
+
+  /// Этап процесса, к которому приложен файл (для вложений заявки).
+  ///
+  /// ТЗ говорит о «прикладывании файлов в статусы», а условие «из этапа нельзя
+  /// выйти без документа» проверяется по файлам именно этого этапа: иначе
+  /// его закрывал бы любой файл, приложенный когда-то раньше, — например,
+  /// скан с первой встречи пропускал бы заявку дальше подписания договора.
+  /// Подпись фиксируется на момент загрузки, как в журнале переходов.
+  stateKey   String? @map("state_key")
+  stateLabel String? @map("state_label")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([entityType, entityId])
+  @@index([entityType, entityId, stateKey])
+  @@index([sha256])
+  @@index([scanStatus])
+  @@map("attachment")
+}
+
+// ===========================================================================
+//  ИМПОРТ XLS/XLSX
+// ===========================================================================
+
+/// Сущность, в которую импортируются строки файла.
+enum ImportTarget {
+  UNIVERSITY_CATALOG
+  ENGAGEMENT
+  LICENSE
+}
+
+enum ImportJobStatus {
+  PENDING
+  PARSING
+  DRY_RUN_READY
+  APPLYING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+/// Сохранённый профиль сопоставления колонок файла с полями сущности.
+/// Переиспользуется между загрузками: заказчик присылает файлы
+/// одного формата регулярно.
+model ImportMappingProfile {
+  id     String       @id @default(uuid()) @db.Uuid
+  name   String       @unique
+  target ImportTarget
+  /// { "Название ВУЗа": "university.name", "Вендор": "vendor.name", ... }
+  mapping Json        @db.JsonB
+  isDefault Boolean   @default(false) @map("is_default")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  jobs ImportJob[]
+
+  @@map("import_mapping_profile")
+}
+
+/// Задача импорта. Проходит цикл: загрузка → разбор → dry-run → применение.
+model ImportJob {
+  id     String          @id @default(uuid()) @db.Uuid
+  target ImportTarget
+  status ImportJobStatus @default(PENDING)
+
+  fileName   String @map("file_name")
+  storageKey String @map("storage_key")
+  /// SHA-256 файла — отсекает повторную загрузку того же документа.
+  fileSha256 String @map("file_sha256")
+
+  profileId String?               @map("profile_id") @db.Uuid
+  profile   ImportMappingProfile? @relation(fields: [profileId], references: [id], onDelete: SetNull)
+  /// Фактически применённый маппинг (мог быть скорректирован вручную).
+  appliedMapping Json? @map("applied_mapping") @db.JsonB
+
+  /// Итоги разбора: { total, toCreate, toUpdate, invalid, duplicates }.
+  stats Json? @db.JsonB
+
+  /// Решения пользователя по неоднозначным совпадениям вузов:
+  /// { "<нормализованное имя из файла>": "<id вуза>" | "CREATE_NEW" }.
+  ///
+  /// Хранятся отдельно от stats, поскольку переживают повторный разбор:
+  /// пользователь мог исправить маппинг колонок, но принятые им решения
+  /// о том, какие вузы считать одинаковыми, при этом не устаревают.
+  resolutions Json? @db.JsonB
+
+  /// Ключ файла с отчётом об ошибках (xlsx с исходными строками и причинами).
+  errorReportKey String? @map("error_report_key")
+
+  createdById String  @map("created_by_id") @db.Uuid
+  createdBy   AppUser @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  startedAt  DateTime? @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  rowErrors ImportRowError[]
+
+  @@index([status, createdAt])
+  @@index([createdById])
+  @@index([fileSha256])
+  @@map("import_job")
+}
+
+/// Ошибка в конкретной строке импортируемого файла.
+model ImportRowError {
+  id     BigInt    @id @default(autoincrement())
+  jobId  String    @map("job_id") @db.Uuid
+  job    ImportJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  rowNumber  Int     @map("row_number")
+  columnName String? @map("column_name")
+  errorCode  String  @map("error_code")
+  message    String
+  /// Исходные значения строки — для выгрузки отчёта об ошибках.
+  rawRow     Json?   @map("raw_row") @db.JsonB
+
+  @@index([jobId, rowNumber])
+  @@map("import_row_error")
+}
+
+// ===========================================================================
+//  ОТЧЁТЫ
+// ===========================================================================
+
+enum ReportFormat {
+  XLSX
+  XLS
+  PDF
+  CSV
+  JSON
+}
+
+enum ReportJobStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+/// Сохранённый шаблон отчёта: набор колонок и фильтров.
+/// Требование ТЗ: формирование отчётов «по выбранным колонкам».
+model ReportDefinition {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String
+  description String?
+
+  /// Ключи колонок из белого списка приложения (НЕ произвольный SQL).
+  /// Защита от инъекций: ключ отображается в SQL-выражение на бэкенде.
+  columns String[]
+  /// Фильтры: период, вузы, направления, продукты, ответственные.
+  filters Json @db.JsonB
+
+  ownerId  String  @map("owner_id") @db.Uuid
+  owner    AppUser @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  /// Доступен ли шаблон другим пользователям.
+  isShared Boolean @default(false) @map("is_shared")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  jobs ReportJob[]
+
+  @@unique([ownerId, name])
+  @@index([isShared])
+  @@map("report_definition")
+}
+
+/// Задача формирования отчёта.
+model ReportJob {
+  id     String          @id @default(uuid()) @db.Uuid
+  status ReportJobStatus @default(QUEUED)
+  format ReportFormat
+
+  definitionId String?           @map("definition_id") @db.Uuid
+  definition   ReportDefinition? @relation(fields: [definitionId], references: [id], onDelete: SetNull)
+  /// Снимок параметров на момент запуска: отчёт должен быть воспроизводим,
+  /// даже если шаблон впоследствии изменили.
+  paramsSnapshot Json @map("params_snapshot") @db.JsonB
+
+  /// Хэш (параметры + область видимости пользователя).
+  /// Служит ключом дедупликации: одинаковые запросы считаются один раз.
+  paramsHash String @map("params_hash")
+
+  rowCount   Int?    @map("row_count")
+  resultKey  String? @map("result_key")
+  resultSize BigInt? @map("result_size")
+  /// Доля выполнения 0..100 — транслируется клиенту по WebSocket.
+  progress   Int     @default(0)
+  errorCode  String? @map("error_code")
+  errorDetail String? @map("error_detail")
+
+  requestedById String  @map("requested_by_id") @db.Uuid
+  requestedBy   AppUser @relation(fields: [requestedById], references: [id], onDelete: Restrict)
+
+  queuedAt   DateTime  @default(now()) @map("queued_at")
+  startedAt  DateTime? @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+  /// Момент, после которого файл удаляется фоновой задачей.
+  expiresAt  DateTime? @map("expires_at")
+
+  @@index([requestedById, queuedAt])
+  @@index([status])
+  @@index([paramsHash])
+  @@index([expiresAt])
+  @@map("report_job")
+}
+
+// ===========================================================================
+//  ИНТЕГРАЦИИ
+// ===========================================================================
+
+enum IntegrationSourceType {
+  LMS
+  WEBSITE
+}
+
+enum SyncRunStatus {
+  RUNNING
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+model IntegrationSource {
+  id       String                @id @default(uuid()) @db.Uuid
+  type     IntegrationSourceType
+  name     String                @unique
+  baseUrl  String                @map("base_url")
+  isEnabled Boolean              @default(true) @map("is_enabled")
+  /// Курсор инкрементальной синхронизации (обычно метка времени).
+  syncCursor String?             @map("sync_cursor")
+  /// Расписание в cron-формате; null — только ручной запуск.
+  cronSchedule String?           @map("cron_schedule")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  runs    IntegrationSyncRun[]
+  staging IntegrationStagingRecord[]
+
+  @@map("integration_source")
+}
+
+model IntegrationSyncRun {
+  id       String            @id @default(uuid()) @db.Uuid
+  sourceId String            @map("source_id") @db.Uuid
+  source   IntegrationSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  status SyncRunStatus @default(RUNNING)
+
+  fetched  Int @default(0)
+  created  Int @default(0)
+  updated  Int @default(0)
+  skipped  Int @default(0)
+  failed   Int @default(0)
+
+  errorDetail String? @map("error_detail")
+
+  startedAt  DateTime  @default(now()) @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+
+  @@index([sourceId, startedAt])
+  @@map("integration_sync_run")
+}
+
+/// Сырой ответ внешней системы до преобразования во внутренние сущности.
+/// Нужен для разбора инцидентов и повторного проигрывания синхронизации
+/// без обращения к внешнему API.
+model IntegrationStagingRecord {
+  id       BigInt            @id @default(autoincrement())
+  sourceId String            @map("source_id") @db.Uuid
+  source   IntegrationSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  externalId String  @map("external_id")
+  entityKind String  @map("entity_kind")
+  payload    Json    @db.JsonB
+  /// Ошибка валидации схемой, если запись не удалось принять.
+  validationError String? @map("validation_error")
+  processedAt DateTime? @map("processed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([sourceId, entityKind, externalId])
+  @@index([processedAt])
+  @@map("integration_staging_record")
+}
+
+// ===========================================================================
+//  КЭШ ДЕЙСТВИЙ ПОЛЬЗОВАТЕЛЯ (функц. требование п.13)
+// ===========================================================================
+
+/// Рабочий контекст пользователя: фильтры, выбранные колонки, сортировка,
+/// открытые вкладки. Восстанавливается после перезагрузки страницы и при
+/// входе с другого устройства (НФТ 2: страница не должна сбрасываться).
+///
+/// Горячая копия живёт в Redis; эта таблица — долговременное хранилище,
+/// переживающее очистку кэша.
+model UserWorkspaceState {
+  id     String  @id @default(uuid()) @db.Uuid
+  userId String  @map("user_id") @db.Uuid
+  user   AppUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Экран или раздел, к которому относится состояние: 'engagements.list'.
+  scopeKey String @map("scope_key")
+  state    Json   @db.JsonB
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, scopeKey])
+  @@map("user_workspace_state")
+}
+
+/// Черновик незавершённого ввода: недописанный комментарий к переходу,
+/// частично заполненная форма. Автосохраняется, переживает потерю связи.
+model UserDraft {
+  id     String  @id @default(uuid()) @db.Uuid
+  userId String  @map("user_id") @db.Uuid
+  user   AppUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  entityType String  @map("entity_type")
+  entityId   String? @map("entity_id")
+  payload    Json    @db.JsonB
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, entityType, entityId])
+  @@index([userId, updatedAt])
+  @@map("user_draft")
+}
+
+/// Недавно просмотренные объекты — быстрый возврат к работе.
+model UserRecentItem {
+  id     BigInt  @id @default(autoincrement())
+  userId String  @map("user_id") @db.Uuid
+  user   AppUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  title      String
+  visitedAt  DateTime @default(now()) @map("visited_at")
+
+  @@unique([userId, entityType, entityId])
+  @@index([userId, visitedAt])
+  @@map("user_recent_item")
+}
+
+/// Ключ идемпотентности: повторная отправка того же запроса
+/// (двойной клик, ретрай после таймаута) не создаёт дубль.
+model IdempotencyKey {
+  key         String   @id
+  userId      String   @map("user_id") @db.Uuid
+  method      String
+  path        String
+  /// Хэш тела запроса: тот же ключ с другим телом — ошибка CRM-ACT-0001.
+  requestHash String   @map("request_hash")
+  statusCode  Int?     @map("status_code")
+  response    Json?    @db.JsonB
+  /// Признак «операция ещё выполняется» — защита от гонки параллельных повторов.
+  inFlight    Boolean  @default(true) @map("in_flight")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  expiresAt DateTime @map("expires_at")
+
+  @@index([expiresAt])
+  @@index([userId])
+  @@map("idempotency_key")
+}
+
+// ===========================================================================
+//  ЛЕНТА ДЕЙСТВИЙ
+// ===========================================================================
+
+/// Что произошло. Перечень закрытый: по типу интерфейс выбирает значок
+/// и текст, а лента фильтруется без разбора произвольных строк.
+enum ActivityType {
+  ENGAGEMENT_CREATED
+  ENGAGEMENT_UPDATED
+  STATE_CHANGED
+  INTEREST_CHANGED
+  OWNER_CHANGED
+  NOTE_ADDED
+  NOTE_UPDATED
+  NOTE_DELETED
+  ATTACHMENT_ADDED
+  ATTACHMENT_DELETED
+  TASK_CREATED
+  TASK_UPDATED
+  TASK_COMPLETED
+  TASK_REOPENED
+  TASK_DELETED
+  PAYMENT_CONFIRMED
+  LMS_EXPORTED
+  ENGAGEMENT_ARCHIVED
+  ENGAGEMENT_RESTORED
+  MEETING_SCHEDULED
+  MEETING_UPDATED
+}
+
+/// Кто стал причиной действия.
+enum ActivitySource {
+  /// Человек в интерфейсе.
+  USER
+  /// Событие LMS или сайта.
+  INTEGRATION
+  /// Перенос заявки при публикации новой редакции процесса.
+  WORKFLOW
+}
+
+/// Лента действий по заявкам и задачам.
+///
+/// Отвечает на два вопроса, которые журнал аудита не закрывает: «что я сам
+/// менял за последние недели» — менеджер возвращается к вузу спустя время
+/// и восстанавливает ход работы — и «что происходило с этой заявкой» во всей
+/// полноте, а не только смены статуса.
+///
+/// Журнал аудита для этого не годится: он служит безопасности, доступен
+/// только администратору, хранит сетевые реквизиты и маскированные снимки
+/// и подчиняется своему сроку хранения. Здесь — прикладная история.
+///
+/// Таблица только дополняется (UPDATE запрещён триггером). Текст заметки,
+/// имя файла и название задачи сюда не копируются — они берутся из своих
+/// записей при чтении, поэтому правка и удаление заметки отражаются в ленте,
+/// а не остаются в ней навсегда. Исключение одно — короткое обоснование
+/// оценки заинтересованности: в карточке оно перезаписывается, и без копии
+/// история причин смены оценки терялась бы.
+model ActivityEvent {
+  id BigInt @id @default(autoincrement())
+
+  occurredAt DateTime       @default(now()) @map("occurred_at")
+  type       ActivityType
+  source     ActivitySource @default(USER)
+
+  /// Автор действия. Пусто — действие выполнила внешняя система.
+  actorId String?  @map("actor_id") @db.Uuid
+  actor   AppUser? @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  engagementId String?     @map("engagement_id") @db.Uuid
+  engagement   Engagement? @relation(fields: [engagementId], references: [id], onDelete: Cascade)
+
+  /// Этап заявки, к которому относится действие, — на момент действия.
+  stateKey   String? @map("state_key")
+  stateLabel String? @map("state_label")
+
+  /// Ссылки на предмет действия. Внешних ключей нет намеренно: таблица
+  /// неизменяема, а ON DELETE SET NULL означал бы запрещённый UPDATE.
+  noteId       String? @map("note_id") @db.Uuid
+  attachmentId String? @map("attachment_id") @db.Uuid
+  taskId       String? @map("task_id") @db.Uuid
+  /// Запись журнала переходов. Уникальна: один переход — одно событие.
+  transitionId BigInt? @unique @map("transition_id")
+
+  /// Подробности: ключи и подписи статусов, прежнее и новое значение
+  /// оценки с обоснованием, изменённые поля, идентификаторы.
+  details Json? @db.JsonB
+
+  @@index([actorId, occurredAt])
+  @@index([engagementId, occurredAt])
+  @@index([taskId])
+  @@map("activity_event")
+}
+
+// ===========================================================================
+//  КАЛЕНДАРЬ ЗАДАЧ
+// ===========================================================================
+
+/// Задача в календаре — дело с датой: «позвонить в МИФИ», «отправить
+/// договор на подпись».
+///
+/// Задача принадлежит исполнителю. Руководитель может поставить задачу
+/// подчинённому; исполнитель такую задачу выполняет, но не правит и не
+/// удаляет — иначе поручение можно было бы молча переписать.
+model PlannerTask {
+  id String @id @default(uuid()) @db.Uuid
+
+  ownerId String  @map("owner_id") @db.Uuid
+  owner   AppUser @relation("TaskOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  /// Кто поставил задачу. Совпадает с исполнителем, если задача своя.
+  createdById String?  @map("created_by_id") @db.Uuid
+  createdBy   AppUser? @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  /// Заявка, к которой относится задача. Необязательна: не всякое дело
+  /// привязано к конкретному вузу.
+  engagementId String?     @map("engagement_id") @db.Uuid
+  engagement   Engagement? @relation(fields: [engagementId], references: [id], onDelete: SetNull)
+
+  title       String
+  description String?
+
+  /// Дата, к которой привязана задача, — календарный день без часового пояса.
+  dueDate DateTime  @map("due_date") @db.Date
+  /// Точный момент, если задача назначена на время. Пусто — на весь день.
+  dueAt   DateTime? @map("due_at")
+
+  /// Когда напомнить. Напоминание уходит обычным уведомлением.
+  remindAt       DateTime? @map("remind_at")
+  reminderSentAt DateTime? @map("reminder_sent_at")
+
+  completedAt DateTime? @map("completed_at")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([ownerId, dueDate])
+  @@index([createdById])
+  @@index([engagementId])
+  @@map("planner_task")
+}
+
+// ===========================================================================
+//  АУДИТ И СЛУЖЕБНЫЕ ТАБЛИЦЫ
+// ===========================================================================
+
+/// Журнал действий пользователей (152-ФЗ, ФСТЭК — группа мер РСБ).
+///
+/// Записи неизменяемы и связаны хэш-цепочкой: `hash` считается от содержимого
+/// записи и `prevHash`. Любая правка задним числом разрывает цепочку и
+/// обнаруживается при проверке целостности журнала.
+/// Секционируется по месяцам отдельной SQL-миграцией.
+model AuditLog {
+  id BigInt @id @default(autoincrement())
+
+  occurredAt DateTime @default(now()) @map("occurred_at")
+
+  actorId   String? @map("actor_id") @db.Uuid
+  actorEmail String? @map("actor_email")
+  /// Действие: LOGIN, VIEW_PD, EXPORT_REPORT, TRANSITION, UPDATE и т.д.
+  action     String
+  entityType String? @map("entity_type")
+  entityId   String? @map("entity_id")
+
+  ipAddress String? @map("ip_address")
+  userAgent String? @map("user_agent")
+  traceId   String? @map("trace_id")
+
+  /// Значения до и после изменения (с маскированием ПДн).
+  beforeState Json? @map("before_state") @db.JsonB
+  afterState  Json? @map("after_state") @db.JsonB
+
+  /// Звено хэш-цепочки целостности.
+  prevHash String? @map("prev_hash")
+  hash     String
+
+  @@index([occurredAt])
+  @@index([actorId, occurredAt])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@map("audit_log")
+}
+
+/// Исходящие доменные события (паттерн Outbox).
+/// Событие пишется в одной транзакции с изменением данных, а публикуется
+/// отдельным процессом — это исключает расхождение между БД и очередью.
+model OutboxEvent {
+  id          BigInt    @id @default(autoincrement())
+  eventType   String    @map("event_type")
+  payload     Json      @db.JsonB
+  createdAt   DateTime  @default(now()) @map("created_at")
+  publishedAt DateTime? @map("published_at")
+  attempts    Int       @default(0)
+  lastError   String?   @map("last_error")
+
+  @@index([publishedAt, createdAt])
+  @@map("outbox_event")
+}
+
+/// Канал доставки уведомления.
+///
+/// Состав задан ответами постановщика: «я бы пошёл по классике — Telegram
+/// либо MAX», плюс возможность подключения почты. Внутриигровой канал
+/// (IN_APP) остаётся основным: он работает в закрытом контуре без каких-либо
+/// внешних подключений.
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  TELEGRAM
+  MAX
+}
+
+model Notification {
+  id     BigInt  @id @default(autoincrement())
+  userId String  @map("user_id") @db.Uuid
+  user   AppUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  channel NotificationChannel @default(IN_APP)
+  subject String
+  body    String
+  /// Ссылка на объект, к которому относится уведомление.
+  entityType String? @map("entity_type")
+  entityId   String? @map("entity_id")
+
+  readAt DateTime? @map("read_at")
+  sentAt DateTime? @map("sent_at")
+  /// Причина, по которой доставка не состоялась. Пусто — доставлено либо
+  /// канал не требует доставки (IN_APP виден в интерфейсе сразу).
+  deliveryError String? @map("delivery_error")
+
+  /// Ключ повторной отправки.
+  ///
+  /// Напоминание о зависшей заявке формируется по расписанию, и без такого
+  /// ключа оно уходило бы при каждом прогоне — по нескольку раз в сутки,
+  /// пока статус не сменится. Уникальность ключа превращает повтор
+  /// в ничего не делающую операцию.
+  dedupeKey String? @unique @map("dedupe_key")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, readAt, createdAt])
+  @@map("notification")
+}
+
+/// Настройка канала доставки.
+///
+/// Хранится в базе, а не в переменных окружения: заказчик просил
+/// «предусмотреть возможность подключения и настроек подобного рода»,
+/// то есть администратор задаёт их в интерфейсе, не трогая развёртывание.
+model NotificationChannelConfig {
+  channel   NotificationChannel @id
+  isEnabled Boolean             @default(false) @map("is_enabled")
+
+  /// Параметры подключения: адрес бота, идентификатор чата, узел SMTP.
+  /// Секреты отдаются наружу замаскированными — см. NotificationService.
+  settings Json @default("{}") @db.JsonB
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("notification_channel_config")
+}
+
+/// Правила уведомлений. Таблица на одну строку: правила общие для системы.
+model NotificationPolicy {
+  /// Фиксированный идентификатор единственной строки.
+  id Int @id @default(1)
+
+  /// Через сколько дней простоя в одном статусе уходит напоминание.
+  /// Значение настраивается: на сессии прозвучало «более одной или двух
+  /// недель», точный срок оставлен на усмотрение эксплуатации.
+  escalationDays Int @default(14) @map("escalation_days")
+
+  /// Уведомлять ответственного о смене статуса его заявки.
+  notifyOwnerOnTransition Boolean @default(true) @map("notify_owner_on_transition")
+
+  /// Дублировать напоминание руководителю ответственного.
+  notifyManagerOnEscalation Boolean @default(true) @map("notify_manager_on_escalation")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("notification_policy")
+}

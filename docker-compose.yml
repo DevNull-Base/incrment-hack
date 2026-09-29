@@ -1,0 +1,423 @@
+# ============================================================================
+#  CRM «ИТ Школа РТК» — локальный и демонстрационный стенд
+#
+#  Полный стек:      docker compose up -d
+#  Только инфра:     docker compose up -d postgres redis minio keycloak
+#  С антивирусом:    docker compose --profile security up -d
+#  С мониторингом:   docker compose --profile observability up -d
+#
+#  Пароли ниже — демонстрационные. Для реального развёртывания значения
+#  задаются через .env и не попадают в репозиторий.
+# ============================================================================
+
+name: rtk-crm
+
+services:
+  # ---------------------------------------------------------------- База ---
+  postgres:
+    image: postgres:17-alpine
+    container_name: crm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-crm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crm_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-crm}
+      # Локаль ОБЯЗАТЕЛЬНО должна быть UTF-8-совместимой.
+      # При --locale=C Postgres не считает кириллицу буквами: pg_trgm
+      # не строит ни одной триграммы (show_trgm('казанский') = {}), а ILIKE
+      # не приводит регистр. Поиск вузов и выявление дубликатов при этом
+      # молча перестают работать — запросы возвращают пустой результат
+      # без единой ошибки. Для сортировки по русскому алфавиту
+      # используется провайдер ICU.
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C.UTF-8 --locale-provider=icu --icu-locale=ru-RU'
+    command:
+      # Параметры под профиль нагрузки: много коротких запросов + тяжёлые отчёты.
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      # Логирование медленных запросов — основа для оптимизации под НФТ «отклик ≤ 1 с».
+      - -c
+      - log_min_duration_statement=500
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-crm} -d ${POSTGRES_DB:-crm}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # --------------------------------------------------------------- Кэш -----
+  redis:
+    image: redis:7-alpine
+    container_name: crm-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      # Политика вытеснения ОБЯЗАТЕЛЬНО noeviction.
+      #
+      # Первоначально стояла volatile-lru из соображения «вытесняться будет
+      # только кэш, у которого выставлен TTL». Рассуждение неверное: BullMQ
+      # сам проставляет TTL на служебные ключи — блокировки задач и записи
+      # о завершении. При нехватке памяти Redis вытеснил бы их наравне
+      # с кэшем, и задачи пропадали бы молча, без ошибки. BullMQ прямо
+      # предупреждает об этом при подключении.
+      #
+      # При noeviction переполнение памяти приводит к отказу записи.
+      # Для кэша это безопасно: все обращения к нему обёрнуты обработкой
+      # ошибок и приложение продолжает работать, читая данные из БД.
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ------------------------------------------------- Объектное хранилище ---
+  minio:
+    # Образы MinIO публикуются на quay.io (на Docker Hub доступ закрыт).
+    image: quay.io/minio/minio:latest
+    container_name: crm-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    ports:
+      - '${MINIO_PORT:-9000}:9000'
+      - '${MINIO_CONSOLE_PORT:-9001}:9001'
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Одноразовая задача: создаёт бакеты и выключает публичный доступ.
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: crm-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin} &&
+      mc mb --ignore-existing local/${S3_BUCKET_ATTACHMENTS:-crm-attachments} &&
+      mc mb --ignore-existing local/${S3_BUCKET_REPORTS:-crm-reports} &&
+      mc anonymous set none local/${S3_BUCKET_ATTACHMENTS:-crm-attachments} &&
+      mc anonymous set none local/${S3_BUCKET_REPORTS:-crm-reports} &&
+      echo 'Бакеты готовы, публичный доступ закрыт.'
+      "
+    restart: 'no'
+
+  # ----------------------------------------------------------- Keycloak ----
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: crm-keycloak
+    restart: unless-stopped
+    command: ['start-dev', '--import-realm']
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HEALTH_ENABLED: 'true'
+      KC_HTTP_ENABLED: 'true'
+    ports:
+      - '${KEYCLOAK_PORT:-8080}:8080'
+    volumes:
+      # Realm с ролями и демонстрационными пользователями импортируется
+      # при первом старте — стенд поднимается одной командой.
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.1\\nHost: localhost\\nConnection: close\\n\\n' >&3 && cat <&3 | grep -q '200 OK'"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ------------------------------------------------------- Антивирус -------
+  # Проверка загружаемых файлов (мера АВЗ по требованиям ФСТЭК).
+  # Вынесен в профиль: контейнер держит базы сигнатур в памяти (~1 ГБ)
+  # и не нужен при обычной разработке.
+  clamav:
+    image: clamav/clamav:stable
+    container_name: crm-clamav
+    restart: unless-stopped
+    profiles: ['security', 'full']
+    ports:
+      - '${CLAMAV_PORT:-3310}:3310'
+    volumes:
+      - clamav-data:/var/lib/clamav
+    healthcheck:
+      test: ['CMD-SHELL', 'clamdcheck.sh || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ------------------------------------------------------ Миграции ---------
+  # Отдельная одноразовая задача, а не шаг старта приложения: при нескольких
+  # репликах api одновременный запуск миграций привёл бы к гонке.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Отдельная стадия с Prisma CLI: в рабочем образе инструментария нет.
+      target: migrator
+    container_name: crm-migrate
+    profiles: ['app', 'full']
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-crm}:${POSTGRES_PASSWORD:-crm_dev_password}@postgres:5432/${POSTGRES_DB:-crm}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
+  # ------------------------------------------------- Имитатор внешних систем --
+  #
+  # Доступа к настоящим LMS и сайту заказчик не даёт: обе системы в переработке,
+  # а контур стенда закрытый. Имитатор занимает их место — отдаёт события,
+  # принимает состояние заявок и умеет сам постучаться в CRM подписанным
+  # вызовом. Когда контракт передадут, в настройках меняется адрес, и код
+  # приложения остаётся прежним.
+  #
+  # Две системы — два порта, как и в реальном контуре с точка-точка доступом.
+  mock-external:
+    image: node:24-alpine
+    container_name: crm-mock-external
+    restart: unless-stopped
+    profiles: ['app', 'full', 'mock']
+    working_dir: /app
+    command: ['node', 'mock-external/server.mjs']
+    environment:
+      MOCK_LMS_PORT: 4010
+      MOCK_SITE_PORT: 4011
+      # Адрес CRM для обратных вызовов. Переопределяется при локальной
+      # разработке, когда приложение запущено вне контейнера.
+      CRM_BASE_URL: ${MOCK_CRM_BASE_URL:-http://api:3000}
+      INTEGRATION_WEBHOOK_SECRET: ${INTEGRATION_WEBHOOK_SECRET:-}
+    volumes:
+      - ./mock-external:/app/mock-external:ro
+    ports:
+      - '${MOCK_LMS_PORT:-4010}:4010'
+      - '${MOCK_SITE_PORT:-4011}:4011'
+
+  # ------------------------------------------------------------ API --------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: crm-api
+    restart: unless-stopped
+    profiles: ['app', 'full']
+    environment:
+      NODE_ENV: production
+      APP_ROLE: api
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-crm}:${POSTGRES_PASSWORD:-crm_dev_password}@postgres:5432/${POSTGRES_DB:-crm}?schema=public
+      REDIS_URL: redis://redis:6379
+      # Внутренний адрес — для получения ключей проверки подписи.
+      KEYCLOAK_BASE_URL: http://keycloak:8080
+      # Публичный адрес ОБЯЗАТЕЛЕН: токен выпускается браузеру через
+      # localhost:8080 и несёт этот адрес в claim `iss`. Без переменной
+      # контейнер сверял бы issuer с внутренним именем keycloak:8080
+      # и отвергал бы все корректные токены с ошибкой CRM-AUT-0003.
+      KEYCLOAK_PUBLIC_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-rtk-crm}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-crm-backend}
+      KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-crm-backend}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CLAMAV_ENABLED: ${CLAMAV_ENABLED:-false}
+      CLAMAV_HOST: clamav
+      # Выдача непроверенных файлов; в production запрещена валидацией.
+      ALLOW_UNSCANNED_DOWNLOAD: ${ALLOW_UNSCANNED_DOWNLOAD:-false}
+      # Ограничение интенсивности обращений (защита от массовой выгрузки).
+      THROTTLE_TTL_SEC: ${THROTTLE_TTL_SEC:-60}
+      THROTTLE_LIMIT: ${THROTTLE_LIMIT:-300}
+      THROTTLE_EXPORT_LIMIT: ${THROTTLE_EXPORT_LIMIT:-30}
+      # Сроки хранения данных (152-ФЗ). Очистку выполняет worker.
+      RETENTION_CRON: ${RETENTION_CRON:-0 30 3 * * *}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-1095}
+      PERSONAL_DATA_RETENTION_DAYS: ${PERSONAL_DATA_RETENTION_DAYS:-1095}
+      ATTACHMENT_PURGE_GRACE_DAYS: ${ATTACHMENT_PURGE_GRACE_DAYS:-30}
+      WORKSPACE_RETENTION_DAYS: ${WORKSPACE_RETENTION_DAYS:-90}
+      S3_SERVER_SIDE_ENCRYPTION: ${S3_SERVER_SIDE_ENCRYPTION:-none}
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-true}
+      SWAGGER_USER: ${SWAGGER_USER:-docs}
+      SWAGGER_PASSWORD: ${SWAGGER_PASSWORD:-}
+      # Обмен с LMS и сайтом. Без этих строк процесс не видел настроек
+      # из .env стенда: работал в режиме встроенных примеров вместо обмена
+      # с имитатором по сети и принимал события без проверки подписи.
+      INTEGRATION_MODE: ${INTEGRATION_MODE:-stub}
+      LMS_BASE_URL: ${LMS_BASE_URL:-http://mock-external:4010}
+      LMS_TOKEN: ${LMS_TOKEN:-}
+      CMS_BASE_URL: ${CMS_BASE_URL:-http://mock-external:4011}
+      CMS_TOKEN: ${CMS_TOKEN:-}
+      INTEGRATION_WEBHOOK_SECRET: ${INTEGRATION_WEBHOOK_SECRET:-}
+      # Ключ маскирования ПДн в журнале аудита — один для API и worker.
+      AUDIT_MASK_KEY: ${AUDIT_MASK_KEY:-}
+      INTEGRATION_SYNC_CRON: ${INTEGRATION_SYNC_CRON:-0 */15 * * * *}
+      INTEGRATION_OUTBOX_CRON: ${INTEGRATION_OUTBOX_CRON:-*/30 * * * * *}
+      # Расписания и часовой пояс календаря — по той же причине.
+      ESCALATION_CRON: ${ESCALATION_CRON:-0 0 9 * * *}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
+      TASK_REMINDER_CRON: ${TASK_REMINDER_CRON:-0 * * * * *}
+    ports:
+      - '${API_PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      # Приложение стартует только после успешного применения миграций.
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('http').get('http://127.0.0.1:3000/health/live',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # --------------------------------------------------------- Worker --------
+  # Тот же образ, другая роль процесса. Масштабируется независимо от API:
+  #   docker compose up -d --scale worker=3
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    restart: unless-stopped
+    profiles: ['app', 'full']
+    command: ['npm', 'run', 'worker']
+    environment:
+      NODE_ENV: production
+      APP_ROLE: worker
+      DATABASE_URL: postgresql://${POSTGRES_USER:-crm}:${POSTGRES_PASSWORD:-crm_dev_password}@postgres:5432/${POSTGRES_DB:-crm}?schema=public
+      REDIS_URL: redis://redis:6379
+      # Внутренний адрес — для получения ключей проверки подписи.
+      KEYCLOAK_BASE_URL: http://keycloak:8080
+      # Публичный адрес ОБЯЗАТЕЛЕН: токен выпускается браузеру через
+      # localhost:8080 и несёт этот адрес в claim `iss`. Без переменной
+      # контейнер сверял бы issuer с внутренним именем keycloak:8080
+      # и отвергал бы все корректные токены с ошибкой CRM-AUT-0003.
+      KEYCLOAK_PUBLIC_URL: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-rtk-crm}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-crm-backend}
+      # Обязателен при NODE_ENV=production и для worker: без него проверка
+      # конфигурации роняет процесс, и фоновые задачи молча не выполняются.
+      KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-crm-backend}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CLAMAV_ENABLED: ${CLAMAV_ENABLED:-false}
+      CLAMAV_HOST: clamav
+      # Выдача непроверенных файлов; в production запрещена валидацией.
+      ALLOW_UNSCANNED_DOWNLOAD: ${ALLOW_UNSCANNED_DOWNLOAD:-false}
+      # Ограничение интенсивности обращений (защита от массовой выгрузки).
+      THROTTLE_TTL_SEC: ${THROTTLE_TTL_SEC:-60}
+      THROTTLE_LIMIT: ${THROTTLE_LIMIT:-300}
+      THROTTLE_EXPORT_LIMIT: ${THROTTLE_EXPORT_LIMIT:-30}
+      # Сроки хранения данных (152-ФЗ). Очистку выполняет worker.
+      RETENTION_CRON: ${RETENTION_CRON:-0 30 3 * * *}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-1095}
+      PERSONAL_DATA_RETENTION_DAYS: ${PERSONAL_DATA_RETENTION_DAYS:-1095}
+      ATTACHMENT_PURGE_GRACE_DAYS: ${ATTACHMENT_PURGE_GRACE_DAYS:-30}
+      WORKSPACE_RETENTION_DAYS: ${WORKSPACE_RETENTION_DAYS:-90}
+      # Обмен с LMS и сайтом. Без этих строк процесс не видел настроек
+      # из .env стенда: работал в режиме встроенных примеров вместо обмена
+      # с имитатором по сети и принимал события без проверки подписи.
+      INTEGRATION_MODE: ${INTEGRATION_MODE:-stub}
+      LMS_BASE_URL: ${LMS_BASE_URL:-http://mock-external:4010}
+      LMS_TOKEN: ${LMS_TOKEN:-}
+      CMS_BASE_URL: ${CMS_BASE_URL:-http://mock-external:4011}
+      CMS_TOKEN: ${CMS_TOKEN:-}
+      INTEGRATION_WEBHOOK_SECRET: ${INTEGRATION_WEBHOOK_SECRET:-}
+      # Ключ маскирования ПДн в журнале аудита — один для API и worker.
+      AUDIT_MASK_KEY: ${AUDIT_MASK_KEY:-}
+      INTEGRATION_SYNC_CRON: ${INTEGRATION_SYNC_CRON:-0 */15 * * * *}
+      INTEGRATION_OUTBOX_CRON: ${INTEGRATION_OUTBOX_CRON:-*/30 * * * * *}
+      # Расписания и часовой пояс календаря — по той же причине.
+      ESCALATION_CRON: ${ESCALATION_CRON:-0 0 9 * * *}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
+      TASK_REMINDER_CRON: ${TASK_REMINDER_CRON:-0 * * * * *}
+      S3_SERVER_SIDE_ENCRYPTION: ${S3_SERVER_SIDE_ENCRYPTION:-none}
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-true}
+      SWAGGER_USER: ${SWAGGER_USER:-docs}
+      SWAGGER_PASSWORD: ${SWAGGER_PASSWORD:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # ------------------------------------------------------ Мониторинг -------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: crm-prometheus
+    restart: unless-stopped
+    profiles: ['observability', 'full']
+    ports:
+      - '${PROMETHEUS_PORT:-9090}:9090'
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: crm-grafana
+    restart: unless-stopped
+    profiles: ['observability', 'full']
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    ports:
+      - '${GRAFANA_PORT:-3001}:3000'
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  clamav-data:
+  prometheus-data:
+  grafana-data:

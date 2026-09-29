@@ -1,0 +1,42 @@
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Окружение и секреты — НИКОГДА не коммитим
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Логи
+logs/
+*.log
+npm-debug.log*
+
+# Контракт API (openapi.json) намеренно НЕ игнорируется: фронтенд
+# разрабатывает отдельная команда, и файл нужен им как стабильный
+# артефакт, а изменения контракта должны быть видны в истории.
+
+# Сгенерированные артефакты (создаются при сборке: prisma generate / kysely-codegen)
+src/generated/
+src/infrastructure/database/generated-db.d.ts
+docs/sbom.json
+test/manual/sample-import.xlsx
+samples/
+
+# Локальные данные контейнеров
+.docker-data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Файл импорта realm готовится скриптом развёртывания под домен стенда
+deploy/keycloak-import/
+
+# Снимки и журналы Playwright CLI — рабочие артефакты, не исходники
+web/.playwright-cli/

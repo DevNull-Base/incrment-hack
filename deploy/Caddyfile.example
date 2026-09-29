@@ -1,0 +1,101 @@
+# ============================================================================
+#  Фрагмент конфигурации Caddy для стенда CRM.
+#
+#  Подключается к существующему Caddyfile сервера, а не заменяет его:
+#  рядом с основным конфигом заводится каталог sites, и в основной Caddyfile
+#  один раз добавляется строка
+#
+#    import sites/*.caddyfile
+#
+#  Дальше (пути — под вашу установку Caddy на Windows):
+#
+#    copy C:\www\incrment\repo\deploy\Caddyfile.example C:\caddy\sites\incrment.caddyfile
+#    caddy validate --config C:\caddy\Caddyfile
+#    caddy reload  --config C:\caddy\Caddyfile
+#
+#  Сертификаты Caddy получит сам, если записи A/AAAA уже указывают на сервер.
+#
+#  Наружу смотрит только Caddy. Контейнеры слушают петлевой интерфейс:
+#  127.0.0.1:18080 — API, 127.0.0.1:18081 — Keycloak. Всё остальное
+#  (Postgres, Redis, MinIO, ClamAV) портов не публикует вовсе.
+# ============================================================================
+
+incrment.ru {
+	encode zstd gzip
+
+	# --- API и канал обновлений ---------------------------------------------
+	# Проксируется ровно два префикса. /metrics и /health намеренно остаются
+	# недоступными снаружи: метрики Prometheus раскрывают внутреннее
+	# устройство системы, а пробы нужны только самому серверу.
+	#
+	# /socket.io — транспорт socket.io (пространство имён /ws живёт внутри
+	# него). Отдельного правила для WebSocket не требуется: Caddy сам
+	# пробрасывает Upgrade.
+	@backend path /api/* /socket.io/*
+	handle @backend {
+		reverse_proxy 127.0.0.1:18080
+	}
+
+	# --- Статика фронтенда --------------------------------------------------
+	# Каталог — точка соединения на текущий выпуск; развёртывание переключает
+	# её после того, как новый выпуск полностью распакован, поэтому Caddy
+	# никогда не отдаёт наполовину разложенный каталог.
+	handle {
+		# Точка соединения (junction) на каталог текущего выпуска.
+		# Прямые слэши Caddy на Windows понимает; обратные пришлось бы
+		# экранировать, и любая правка превращалась бы в ребус.
+		root * C:/www/incrment/current
+
+		# Файлы с хэшем в имени неизменны — их можно кэшировать надолго.
+		@immutable path /assets/*
+		header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+		# Всё остальное перепроверяется при каждом обращении (ETag → 304).
+		# Прежде всего index.html: его отдают не только / и /index.html,
+		# но и любой маршрут интерфейса (/interactions/42, /admin/users) —
+		# try_files ниже. Без запрета кэша браузер мог бы открыть страницу,
+		# ссылающуюся на файлы прошлого выпуска, которых уже нет.
+		@mutable not path /assets/*
+		header @mutable Cache-Control "no-cache"
+
+		try_files {path} /index.html
+		file_server
+	}
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	log {
+		output file C:/www/incrment/logs/caddy-app.log {
+			roll_size 20mb
+			roll_keep 10
+		}
+	}
+}
+
+auth.incrment.ru {
+	encode zstd gzip
+
+	# Keycloak сам строит абсолютные ссылки и проверяет, с какого адреса
+	# пришёл запрос. Заголовки X-Forwarded-* Caddy проставляет сам, а в
+	# контейнере включён режим KC_PROXY_HEADERS=xforwarded — иначе Keycloak
+	# выдавал бы токены с внутренним адресом в claim `iss`, и бэкенд отвергал
+	# бы их с ошибкой CRM-AUT-0003.
+	reverse_proxy 127.0.0.1:18081
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+	}
+
+	log {
+		output file C:/www/incrment/logs/caddy-auth.log {
+			roll_size 20mb
+			roll_keep 10
+		}
+	}
+}

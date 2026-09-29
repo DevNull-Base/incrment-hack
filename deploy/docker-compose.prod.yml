@@ -1,0 +1,377 @@
+# ============================================================================
+#  Стенд на сервере Epyc. Запускается только скриптом deploy/deploy.sh.
+#
+#  Отличия от корневого docker-compose.yml — не косметические, поэтому файл
+#  отдельный, а не перекрытие:
+#
+#  1. НАРУЖУ НЕ ТОРЧИТ НИЧЕГО, кроме двух портов на петлевом интерфейсе.
+#     Postgres, Redis, MinIO и ClamAV не публикуют портов вообще: контейнеры
+#     общаются по внутренней сети Docker по именам сервисов. Поэтому Postgres
+#     Forgejo на 5432 и любые другие соседи по серверу не задеты в принципе —
+#     конфликтовать нечему. Наружу смотрит только Caddy.
+#
+#  2. Своё имя проекта (incrment). Имена контейнеров и томов получают префикс
+#     проекта, так что «crm-postgres» соседнего стека не перетирается.
+#
+#  3. Образы помечаются тегом сборки (IMAGE_TAG — SHA коммита). Прошлые теги
+#     остаются на сервере, и откат сводится к запуску с прежним тегом.
+#
+#  4. Keycloak работает в production-режиме с базой в Postgres, а не в
+#     start-dev с файловой H2: стенд для команды переживает перезапуск,
+#     а вход по HTTPS через обратный прокси требует явного hostname.
+# ============================================================================
+
+name: incrment
+
+services:
+  # ---------------------------------------------------------------- База ---
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Вторая база — для Keycloak, создаётся init-скриптом при первом старте.
+      KEYCLOAK_DB_NAME: ${KEYCLOAK_DB_NAME:-keycloak}
+      KEYCLOAK_DB_USER: ${KEYCLOAK_DB_USER:-keycloak}
+      KEYCLOAK_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+      # Локаль обязана быть UTF-8: при --locale=C pg_trgm не строит триграмм
+      # для кириллицы, и поиск вузов молча перестаёт находить что-либо.
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C.UTF-8 --locale-provider=icu --icu-locale=ru-RU'
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - log_min_duration_statement=500
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # --------------------------------------------------------------- Кэш -----
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --maxmemory
+      - 512mb
+      # noeviction обязателен: BullMQ держит в Redis блокировки задач с TTL,
+      # и вытеснение по LRU убивало бы фоновые задачи молча, без ошибки.
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ------------------------------------------------- Объектное хранилище ---
+  minio:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY} ${S3_SECRET_KEY} &&
+      mc mb --ignore-existing local/${S3_BUCKET_ATTACHMENTS:-crm-attachments} &&
+      mc mb --ignore-existing local/${S3_BUCKET_REPORTS:-crm-reports} &&
+      mc anonymous set none local/${S3_BUCKET_ATTACHMENTS:-crm-attachments} &&
+      mc anonymous set none local/${S3_BUCKET_REPORTS:-crm-reports} &&
+      echo 'Бакеты готовы, публичный доступ закрыт.'
+      "
+    restart: 'no'
+
+  # ------------------------------------------------------- Антивирус -------
+  # На стенде обязателен: при NODE_ENV=production проверка конфигурации
+  # не даст приложению стартовать с выключенным антивирусом.
+  clamav:
+    image: clamav/clamav:stable
+    restart: unless-stopped
+    volumes:
+      - clamav-data:/var/lib/clamav
+    healthcheck:
+      test: ['CMD-SHELL', 'clamdcheck.sh || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      # Первый запуск скачивает базы сигнатур — это несколько минут.
+      start_period: 300s
+
+  # ----------------------------------------------------------- Keycloak ----
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    restart: unless-stopped
+    command: ['start', '--import-realm']
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${KEYCLOAK_DB_NAME:-keycloak}
+      KC_DB_USERNAME: ${KEYCLOAK_DB_USER:-keycloak}
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+      # Публичный адрес обязателен: он попадает в claim `iss` выдаваемых
+      # токенов, и бэкенд сверяет issuer именно с ним. Без этого все
+      # корректные токены отвергались бы с ошибкой CRM-AUT-0003.
+      KC_HOSTNAME: ${PUBLIC_AUTH_URL}
+      # TLS терминирует Caddy, внутрь идёт обычный HTTP. Заголовки
+      # X-Forwarded-* нужны, чтобы Keycloak строил ссылки по внешнему имени.
+      KC_HTTP_ENABLED: 'true'
+      KC_PROXY_HEADERS: xforwarded
+      KC_HEALTH_ENABLED: 'true'
+    ports:
+      # Только петлевой интерфейс: снаружи Keycloak доступен через Caddy.
+      - '127.0.0.1:${KEYCLOAK_BIND_PORT:-18081}:8080'
+    volumes:
+      # Realm с ролями и учётными записями. Импортируется ТОЛЬКО при первом
+      # старте с пустой базой; дальнейшие изменения — через консоль Keycloak.
+      # Файл готовит deploy.sh: адреса возврата подставляются под домен стенда.
+      - ${KEYCLOAK_IMPORT_DIR:-./keycloak-import}:/opt/keycloak/data/import:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.1\\nHost: localhost\\nConnection: close\\n\\n' >&3 && cat <&3 | grep -q '200 OK'"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  # ------------------------------------------------------ Миграции ---------
+  # Отдельная одноразовая задача: при нескольких репликах api одновременный
+  # запуск миграций привёл бы к гонке.
+  migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: migrator
+    image: incrment/migrate:${IMAGE_TAG:-dev}
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      # Миграциям хранилище не нужно — только демонстрационному наполнению:
+      # файлы этапов кладутся туда же, куда и загрузки пользователей.
+      # Без этих переменных наполнение пропускает файлы, остальное заводит.
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET_ATTACHMENTS: ${S3_BUCKET_ATTACHMENTS:-crm-attachments}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
+  # ------------------------------------------------- Имитатор внешних систем --
+  #
+  # Занимает место LMS и сайта ИТ Школы: доступа к настоящим системам нет,
+  # обе в переработке, а показать двусторонний обмен нужно. Отдаёт события,
+  # принимает состояние заявок и умеет сам вызвать CRM подписанным запросом.
+  #
+  # Когда заказчик передаст контракт, служба выключается, а в .env
+  # прописываются настоящие адреса — код приложения при этом не меняется.
+  mock-external:
+    image: node:24-alpine
+    restart: unless-stopped
+    profiles: ['app', 'full', 'mock']
+    working_dir: /app
+    command: ['node', 'mock-external/server.mjs']
+    environment:
+      MOCK_LMS_PORT: 4010
+      MOCK_SITE_PORT: 4011
+      CRM_BASE_URL: ${MOCK_CRM_BASE_URL:-http://api:3000}
+      INTEGRATION_WEBHOOK_SECRET: ${INTEGRATION_WEBHOOK_SECRET:-}
+    volumes:
+      - ../mock-external:/app/mock-external:ro
+
+  # ------------------------------------------------------------ API --------
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: runtime
+    image: incrment/api:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      APP_ROLE: api
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      REDIS_URL: redis://redis:6379
+      KEYCLOAK_BASE_URL: http://keycloak:8080
+      KEYCLOAK_PUBLIC_URL: ${PUBLIC_AUTH_URL}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-rtk-crm}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-crm-backend}
+      KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-crm-backend}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET_ATTACHMENTS: ${S3_BUCKET_ATTACHMENTS:-crm-attachments}
+      S3_BUCKET_REPORTS: ${S3_BUCKET_REPORTS:-crm-reports}
+      # Фронтенд отдаётся с того же домена, поэтому запросы однодоменные.
+      # Значение всё равно задано: по нему настраивается и WebSocket-адаптер.
+      CORS_ORIGINS: ${PUBLIC_APP_URL}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CLAMAV_ENABLED: 'true'
+      CLAMAV_HOST: clamav
+      ALLOW_UNSCANNED_DOWNLOAD: 'false'
+      THROTTLE_TTL_SEC: ${THROTTLE_TTL_SEC:-60}
+      THROTTLE_LIMIT: ${THROTTLE_LIMIT:-300}
+      THROTTLE_EXPORT_LIMIT: ${THROTTLE_EXPORT_LIMIT:-30}
+      RETENTION_CRON: ${RETENTION_CRON:-0 30 3 * * *}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-1095}
+      PERSONAL_DATA_RETENTION_DAYS: ${PERSONAL_DATA_RETENTION_DAYS:-1095}
+      ATTACHMENT_PURGE_GRACE_DAYS: ${ATTACHMENT_PURGE_GRACE_DAYS:-30}
+      WORKSPACE_RETENTION_DAYS: ${WORKSPACE_RETENTION_DAYS:-90}
+      S3_SERVER_SIDE_ENCRYPTION: ${S3_SERVER_SIDE_ENCRYPTION:-none}
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-true}
+      SWAGGER_USER: ${SWAGGER_USER:-docs}
+      SWAGGER_PASSWORD: ${SWAGGER_PASSWORD}
+      # Обмен с LMS и сайтом. Без этих строк процесс не видел настроек
+      # из .env стенда: работал в режиме встроенных примеров вместо обмена
+      # с имитатором по сети и принимал события без проверки подписи.
+      INTEGRATION_MODE: ${INTEGRATION_MODE:-live}
+      LMS_BASE_URL: ${LMS_BASE_URL:-http://mock-external:4010}
+      LMS_TOKEN: ${LMS_TOKEN:-}
+      CMS_BASE_URL: ${CMS_BASE_URL:-http://mock-external:4011}
+      CMS_TOKEN: ${CMS_TOKEN:-}
+      INTEGRATION_WEBHOOK_SECRET: ${INTEGRATION_WEBHOOK_SECRET:-}
+      # Ключ маскирования ПДн в журнале аудита — один для API и worker.
+      AUDIT_MASK_KEY: ${AUDIT_MASK_KEY:-}
+      INTEGRATION_SYNC_CRON: ${INTEGRATION_SYNC_CRON:-0 */15 * * * *}
+      INTEGRATION_OUTBOX_CRON: ${INTEGRATION_OUTBOX_CRON:-*/30 * * * * *}
+      # Расписания и часовой пояс календаря — по той же причине.
+      ESCALATION_CRON: ${ESCALATION_CRON:-0 0 9 * * *}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
+      TASK_REMINDER_CRON: ${TASK_REMINDER_CRON:-0 * * * * *}
+    ports:
+      # Единственный вход в систему снаружи — и тот через Caddy на петле.
+      - '127.0.0.1:${API_BIND_PORT:-18080}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Готовности Keycloak API не ждёт намеренно. Ключи проверки подписи
+    # забираются лениво, при первом же запросе с токеном, поэтому запуск
+    # без Keycloak возможен. Ожидание здесь означало бы, что развёртывание
+    # висит до тех пор, пока Keycloak собирает конфигурацию и создаёт схему,
+    # а при неудачной проверке готовности — бесконечно.
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('http').get('http://127.0.0.1:3000/health/live',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  # --------------------------------------------------------- Worker --------
+  # Тот же образ, другая роль процесса: формирование отчётов и импорт
+  # не должны занимать процессор, обслуживающий запросы пользователей.
+  worker:
+    image: incrment/api:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    command: ['npm', 'run', 'worker']
+    environment:
+      NODE_ENV: production
+      APP_ROLE: worker
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      REDIS_URL: redis://redis:6379
+      KEYCLOAK_BASE_URL: http://keycloak:8080
+      KEYCLOAK_PUBLIC_URL: ${PUBLIC_AUTH_URL}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-rtk-crm}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-crm-backend}
+      # Обязателен при NODE_ENV=production и для worker: без него проверка
+      # конфигурации роняет процесс, и фоновые задачи молча не выполняются.
+      KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-crm-backend}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET_ATTACHMENTS: ${S3_BUCKET_ATTACHMENTS:-crm-attachments}
+      S3_BUCKET_REPORTS: ${S3_BUCKET_REPORTS:-crm-reports}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CLAMAV_ENABLED: 'true'
+      CLAMAV_HOST: clamav
+      ALLOW_UNSCANNED_DOWNLOAD: 'false'
+      THROTTLE_TTL_SEC: ${THROTTLE_TTL_SEC:-60}
+      THROTTLE_LIMIT: ${THROTTLE_LIMIT:-300}
+      THROTTLE_EXPORT_LIMIT: ${THROTTLE_EXPORT_LIMIT:-30}
+      RETENTION_CRON: ${RETENTION_CRON:-0 30 3 * * *}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-1095}
+      PERSONAL_DATA_RETENTION_DAYS: ${PERSONAL_DATA_RETENTION_DAYS:-1095}
+      ATTACHMENT_PURGE_GRACE_DAYS: ${ATTACHMENT_PURGE_GRACE_DAYS:-30}
+      WORKSPACE_RETENTION_DAYS: ${WORKSPACE_RETENTION_DAYS:-90}
+      S3_SERVER_SIDE_ENCRYPTION: ${S3_SERVER_SIDE_ENCRYPTION:-none}
+      SWAGGER_ENABLED: 'false'
+      SWAGGER_PASSWORD: ${SWAGGER_PASSWORD}
+      # Обмен с LMS и сайтом. Без этих строк процесс не видел настроек
+      # из .env стенда: работал в режиме встроенных примеров вместо обмена
+      # с имитатором по сети и принимал события без проверки подписи.
+      INTEGRATION_MODE: ${INTEGRATION_MODE:-live}
+      LMS_BASE_URL: ${LMS_BASE_URL:-http://mock-external:4010}
+      LMS_TOKEN: ${LMS_TOKEN:-}
+      CMS_BASE_URL: ${CMS_BASE_URL:-http://mock-external:4011}
+      CMS_TOKEN: ${CMS_TOKEN:-}
+      INTEGRATION_WEBHOOK_SECRET: ${INTEGRATION_WEBHOOK_SECRET:-}
+      # Ключ маскирования ПДн в журнале аудита — один для API и worker.
+      AUDIT_MASK_KEY: ${AUDIT_MASK_KEY:-}
+      INTEGRATION_SYNC_CRON: ${INTEGRATION_SYNC_CRON:-0 */15 * * * *}
+      INTEGRATION_OUTBOX_CRON: ${INTEGRATION_OUTBOX_CRON:-*/30 * * * * *}
+      # Расписания и часовой пояс календаря — по той же причине.
+      ESCALATION_CRON: ${ESCALATION_CRON:-0 0 9 * * *}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
+      TASK_REMINDER_CRON: ${TASK_REMINDER_CRON:-0 * * * * *}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  clamav-data:

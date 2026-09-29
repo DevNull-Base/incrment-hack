@@ -1,0 +1,364 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ======================================== */
+/* Fluid scale — единая размерная сетка      */
+/* Все отступы в Tailwind считаются в rem,   */
+/* поэтому база html масштабирует и сетку,    */
+/* и типографику.                            */
+/* ======================================== */
+:root {
+  font-size: 1rem;
+}
+
+/* Никаких vw/vh: при браузерном зуме CSS-вьюпорт сжимается,
+   и viewport-формула компенсировала бы масштабирование.
+   Ступени только в rem — зум всегда выигрывает. */
+
+/* Планшеты 768–1023 */
+@media (min-width: 48rem) and (max-width: 63.9375rem) {
+  :root {
+    font-size: 0.9375rem;
+  }
+}
+
+/* Планшеты 1024–1199 */
+@media (min-width: 64rem) and (max-width: 74.9375rem) {
+  :root {
+    font-size: 1rem;
+  }
+}
+
+/* Компьютеры 1200–1599 */
+@media (min-width: 75rem) {
+  :root {
+    font-size: 1rem;
+  }
+}
+
+/* Компьютеры от 1600×900 */
+@media (min-width: 100rem) and (min-height: 56.25rem) {
+  :root {
+    font-size: 1.125rem;
+  }
+}
+
+/* Rostelecom Basis — брендовый шрифт rtkit.ru (файлы в public/fonts) */
+@font-face {
+  font-family: "RostelecomBasis";
+  src: url("/fonts/RostelecomBasis-Light.woff2") format("woff2");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "RostelecomBasis";
+  src: url("/fonts/RostelecomBasis-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "RostelecomBasis";
+  src: url("/fonts/RostelecomBasis-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "RostelecomBasis";
+  src: url("/fonts/RostelecomBasis-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@theme {
+  --font-sans: "RostelecomBasis", "Inter", "Basis Grotesque Pro", system-ui, sans-serif;
+  --font-display: "RostelecomBasis", "DM Sans", "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  /* ======================================== */
+  /* Rostelecom Brand Palette                 */
+  /* ======================================== */
+  /* Primary: deep purple #6C5CE7 */
+  /* Accent: warm orange #E8622C */
+  /* Teal: fresh cyan #00B4D8 (secondary accent) */
+  /* ======================================== */
+
+  --color-background: oklch(0.985 0.002 285);
+  --color-foreground: oklch(0.15 0.015 285);
+  --color-card: oklch(1 0 0);
+  --color-card-foreground: oklch(0.15 0.015 285);
+  --color-popover: oklch(1 0 0);
+  --color-popover-foreground: oklch(0.15 0.015 285);
+  --color-primary: oklch(0.52 0.17 290);
+  --color-primary-foreground: oklch(0.99 0 0);
+  --color-secondary: oklch(0.96 0.006 285);
+  --color-secondary-foreground: oklch(0.20 0.015 285);
+  --color-muted: oklch(0.95 0.005 285);
+  --color-muted-foreground: oklch(0.48 0.012 285);
+  --color-accent: oklch(0.62 0.18 35);
+  --color-accent-foreground: oklch(0.99 0 0);
+  --color-destructive: oklch(0.55 0.20 25);
+  --color-destructive-foreground: oklch(0.99 0 0);
+  --color-border: oklch(0.92 0.004 285);
+  --color-input: oklch(0.92 0.004 285);
+  --color-ring: oklch(0.52 0.17 290);
+  --color-sidebar: oklch(1 0 0);
+  --color-sidebar-foreground: oklch(0.15 0.015 285);
+  --color-sidebar-border: oklch(0.92 0.004 285);
+  --color-sidebar-accent: oklch(0.95 0.005 285);
+  --color-success: oklch(0.62 0.15 150);
+  --color-warning: oklch(0.72 0.12 70);
+  --color-info: oklch(0.60 0.10 250);
+
+  /* Rostelecom brand aliases */
+  --color-rt-purple: oklch(0.52 0.17 290);
+  --color-rt-orange: oklch(0.62 0.18 35);
+  --color-rt-teal: oklch(0.65 0.12 200);
+
+  /* Shadows — subtle, layered */
+  --shadow-xs: 0 0.0625rem 0.125rem oklch(0 0 0 / 0.03);
+  --shadow-sm: 0 0.0625rem 0.1875rem oklch(0 0 0 / 0.05), 0 0.0625rem 0.125rem oklch(0 0 0 / 0.03);
+  --shadow-md: 0 0.25rem 0.375rem -0.0625rem oklch(0 0 0 / 0.05), 0 0.125rem 0.25rem -0.125rem oklch(0 0 0 / 0.03);
+  --shadow-lg: 0 0.625rem 0.9375rem -0.1875rem oklch(0 0 0 / 0.05), 0 0.25rem 0.375rem -0.25rem oklch(0 0 0 / 0.03);
+
+  /* Radii — generous, modern */
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.25rem;
+  --radius-2xl: 1.5rem;
+
+  /* Spacing scale — base 0.25rem */
+  --spacing: 0.25rem;
+}
+
+.dark {
+  /* Палитра с rtkit.ru: тёмная база #1D1B1F, текст — белый 90% */
+  color-scheme: dark;
+  --color-background: #1d1b1f;
+  --color-foreground: rgb(255 255 255 / 0.9);
+  --color-card: #262328;
+  --color-card-foreground: rgb(255 255 255 / 0.9);
+  --color-popover: #262328;
+  --color-popover-foreground: rgb(255 255 255 / 0.9);
+  --color-primary: oklch(0.62 0.15 290);
+  --color-primary-foreground: oklch(0.12 0.015 270);
+  --color-secondary: rgb(255 255 255 / 0.08);
+  --color-secondary-foreground: rgb(255 255 255 / 0.9);
+  --color-muted: rgb(255 255 255 / 0.07);
+  --color-muted-foreground: rgb(255 255 255 / 0.55);
+  --color-accent: oklch(0.62 0.17 35);
+  --color-accent-foreground: oklch(0.12 0.015 270);
+  --color-destructive: oklch(0.55 0.20 25);
+  --color-destructive-foreground: oklch(0.94 0.004 270);
+  --color-border: rgb(255 255 255 / 0.1);
+  --color-input: rgb(255 255 255 / 0.1);
+  --color-ring: oklch(0.62 0.15 290);
+  --color-sidebar: #232026;
+  --color-sidebar-foreground: rgb(255 255 255 / 0.85);
+  --color-sidebar-border: rgb(255 255 255 / 0.1);
+  --color-sidebar-accent: rgb(255 255 255 / 0.08);
+  --color-success: oklch(0.62 0.15 150);
+  --color-warning: oklch(0.72 0.12 70);
+}
+
+/* Нативные <select>: явные цвета попапа option (Windows Chromium) */
+.dark option {
+  background-color: #262328;
+  color: rgb(255 255 255 / 0.9);
+}
+
+/* ======================================== */
+/* Base Styles                              */
+/* ======================================== */
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    /* Responsive base: clamps between 15px and 18px */
+    font-size: clamp(0.9375rem, 0.875rem + 0.25vw, 1.125rem);
+    color-scheme: light;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    letter-spacing: -0.01em;
+    line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    letter-spacing: -0.02em;
+    font-weight: 600;
+    user-select: none;
+    line-height: 1.2;
+    font-family: var(--font-display);
+  }
+  h1 { font-size: 1.75rem; }
+  h2 { font-size: 1.375rem; }
+  h3 { font-size: 1.125rem; }
+
+  button, a, [role="button"], nav, aside, header, .no-select {
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  p, span:not(.no-select), td, li, pre, code, textarea, input {
+    user-select: text;
+  }
+}
+
+/* ======================================== */
+/* Scrollbar                                */
+/* ======================================== */
+::-webkit-scrollbar { width: 0.375rem; height: 0.375rem; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: oklch(0.80 0.008 270); border-radius: 0.25rem; }
+::-webkit-scrollbar-thumb:hover { background: oklch(0.65 0.012 270); }
+.dark ::-webkit-scrollbar-thumb { background: oklch(0.30 0.012 270); }
+
+/* ======================================== */
+/* Smooth scrolling                         */
+/* ======================================== */
+html,
+.overflow-y-auto,
+.overflow-auto {
+  scroll-behavior: smooth;
+}
+@media (prefers-reduced-motion: reduce) {
+  html,
+  .overflow-y-auto,
+  .overflow-auto {
+    scroll-behavior: auto;
+  }
+}
+
+/* ======================================== */
+/* Charts & statistics — entrance motion    */
+/* ======================================== */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes chart-grow-y { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+  @keyframes chart-grow-x { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+  @keyframes chart-pop { from { transform: scale(0.6); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  @keyframes chart-fade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes chart-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+
+  .chart-grow-y { transform-box: fill-box; transform-origin: center bottom; animation: chart-grow-y 0.7s cubic-bezier(0.25, 1, 0.5, 1) backwards; }
+  .chart-grow-x { transform-box: fill-box; transform-origin: left center; animation: chart-grow-x 0.7s cubic-bezier(0.25, 1, 0.5, 1) backwards; }
+  .chart-pop { transform-box: fill-box; transform-origin: center; animation: chart-pop 0.5s cubic-bezier(0.25, 1, 0.5, 1) backwards; }
+  .chart-fade { animation: chart-fade 0.6s ease backwards; }
+  .chart-draw { stroke-dasharray: 1; animation: chart-draw 0.9s ease-out backwards; }
+}
+
+/* ======================================== */
+/* Toasts — entrance/exit motion            */
+/* ======================================== */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateX(24px) scale(0.97); }
+    to { opacity: 1; transform: translateX(0) scale(1); }
+  }
+  @keyframes toast-out {
+    from { opacity: 1; transform: translateX(0) scale(1); }
+    to { opacity: 0; transform: translateX(24px) scale(0.97); }
+  }
+  .toast-in { animation: toast-in 0.28s cubic-bezier(0.25, 1, 0.5, 1) both; }
+  .toast-out { animation: toast-out 0.2s cubic-bezier(0.4, 0, 1, 1) both; }
+}
+
+/* Selection */
+::selection {
+  background: oklch(0.52 0.17 290 / 0.15);
+}
+
+/* Focus ring */
+:focus-visible {
+  outline: 2px solid oklch(0.52 0.17 290 / 0.4);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ======================================== */
+/* Kanban / DnD                             */
+/* ======================================== */
+[data-dragging="true"] { opacity: 0.4; }
+.kanban-column-active {
+  background: oklch(0.52 0.17 290 / 0.05) !important;
+}
+[data-dnd-overlay="true"] {
+  animation: dnd-overlay-in 200ms cubic-bezier(0.25, 1, 0.5, 1);
+}
+@keyframes dnd-overlay-in {
+  from { opacity: 0.6; transform: scale(0.98) rotate(0deg); }
+  to { opacity: 1; transform: scale(1.03) rotate(1.5deg); }
+}
+[data-sortable-placeholder="true"] {
+  transition: opacity 200ms ease;
+}
+
+/* ======================================== */
+/* Sidebar V2 — vertical text              */
+/* ======================================== */
+.writing-vertical {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  transform: rotate(180deg);
+  white-space: nowrap;
+}
+
+/* ======================================== */
+/* Sidebar V2 — entrance animation          */
+/* ======================================== */
+.sidebar-enter {
+  animation: sidebar-enter-in 320ms cubic-bezier(0.25, 1, 0.5, 1) both;
+}
+@keyframes sidebar-enter-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-enter,
+  .sidebar-enter * {
+    animation: none !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+/* ======================================== */
+/* Flow editor — подсветка целей инструкции */
+/* ======================================== */
+/* Псевдоэлемент, а не ring/outline: не конфликтует с hover:shadow
+   и с глобальным :focus-visible, поэтому фокус остаётся видимым. */
+.spotlight-ring {
+  position: relative;
+}
+.spotlight-ring::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: calc(var(--radius-lg) + 2px);
+  pointer-events: none;
+  border: 2px solid color-mix(in oklab, var(--color-primary) 65%, transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .spotlight-ring::after {
+    animation: spotlight-pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes spotlight-pulse {
+    0%,
+    100% {
+      border-color: color-mix(in oklab, var(--color-primary) 75%, transparent);
+      transform: scale(1);
+    }
+    50% {
+      border-color: color-mix(in oklab, var(--color-primary) 20%, transparent);
+      transform: scale(1.03);
+    }
+  }
+}
