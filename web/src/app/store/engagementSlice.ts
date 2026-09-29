@@ -64,6 +64,7 @@ export interface EngagementSlice {
     author: { id: string; name: string },
     stage?: { key: string; label: string },
   ) => Promise<ActionResult>
+  removeNote: (engagementId: string, noteId: string) => Promise<ActionResult>
   archiveInteraction: (id: string, reason?: string) => Promise<ActionResult>
   restoreInteraction: (id: string) => Promise<ActionResult>
 
@@ -273,6 +274,31 @@ export const createEngagementSlice: StateCreator<StoreState, [], [], EngagementS
             },
             ...(state.notes[engagementId] ?? []),
           ],
+        },
+      }))
+      return { ok: true }
+    },
+
+    removeNote: async (engagementId, noteId) => {
+      if (isApi) {
+        try {
+          await api.notes.remove(engagementId, noteId)
+          set((state) => ({
+            notes: {
+              ...state.notes,
+              [engagementId]: (state.notes[engagementId] ?? []).filter((note) => note.id !== noteId),
+            },
+          }))
+          refreshAfterChange(engagementId)
+          return { ok: true }
+        } catch (error) {
+          return { ok: false, error: errorText(error) }
+        }
+      }
+      set((state) => ({
+        notes: {
+          ...state.notes,
+          [engagementId]: (state.notes[engagementId] ?? []).filter((note) => note.id !== noteId),
         },
       }))
       return { ok: true }

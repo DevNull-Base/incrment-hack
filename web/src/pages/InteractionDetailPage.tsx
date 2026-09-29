@@ -10,10 +10,20 @@ import {
   selectDocuments,
   selectInteractions,
 } from "@/app/store/selectors"
-import { ArrowLeft, Calendar, FileText, ChartBubble } from "@mynaui/icons-react"
+import { ArrowLeft, FileText, ChartBubble } from "@mynaui/icons-react"
+import {
+  ArrowRight,
+  Building2,
+  Gauge,
+  GitBranch,
+  ListTodo,
+  MessageSquareText,
+  Trash2,
+  UserRound,
+} from "lucide-react"
 import { cn } from "@/lib/utils"
 import { toast } from "@/shared/lib/toast-store"
-import { api, type AttachmentDto, type AvailableTransitionDto } from "@/shared/api"
+import { api, type AttachmentDto, type AvailableTransitionDto, type UniversityContactDto } from "@/shared/api"
 import { dataSource } from "@/shared/config"
 import { StageCanvas, type GraphNode } from "@/components/ui/stage-canvas"
 import { useStages } from "@/app/use-stages"
@@ -39,6 +49,7 @@ const SCAN_LABELS: Record<AttachmentDto["scanStatus"], { label: string; variant:
 }
 
 const isApi = dataSource === "api"
+const EMPTY_UNIVERSITY_CONTACTS: UniversityContactDto[] = []
 
 const formatDate = (value: string | null | undefined) =>
   value ? new Date(value).toLocaleDateString("ru-RU") : "—"
@@ -71,12 +82,14 @@ export function InteractionDetailPage() {
   const loadNotes = useStore((s) => s.loadNotes)
   const loadAttachments = useStore((s) => s.loadAttachments)
   const loadTimeline = useStore((s) => s.loadTimeline)
+  const loadUniversityExtras = useStore((s) => s.loadUniversityExtras)
   const performTransition = useStore((s) => s.performTransition)
   const uploadAttachment = useStore((s) => s.uploadAttachment)
   const removeAttachment = useStore((s) => s.removeAttachment)
   const reassignEngagement = useStore((s) => s.reassignEngagement)
   const createTask = useStore((s) => s.createTask)
   const toggleTask = useStore((s) => s.toggleTask)
+  const removeNote = useStore((s) => s.removeNote)
   const { id } = useParams()
   // Недописанная заметка — черновик рабочего контекста (ТЗ, п. 13).
   const noteDraft = useDraft("engagement.note", id)
@@ -89,6 +102,13 @@ export function InteractionDetailPage() {
   const [taskDue, setTaskDue] = useState("")
   const fileInput = useRef<HTMLInputElement>(null)
 
+  const interaction = interactions.find((i) => i.id === id)
+  const universityContacts = useStore((s) => (
+    interaction?.universityId
+      ? s.universityContacts[interaction.universityId] ?? EMPTY_UNIVERSITY_CONTACTS
+      : EMPTY_UNIVERSITY_CONTACTS
+  ))
+
   // Режим API: карточка, заметки, вложения и история — с бэкенда.
   useEffect(() => {
     if (!id || !isApi) return
@@ -98,7 +118,12 @@ export function InteractionDetailPage() {
     void loadTimeline(id)
   }, [id, loadEngagement, loadNotes, loadAttachments, loadTimeline])
 
-  const interaction = interactions.find((i) => i.id === id)
+  useEffect(() => {
+    if (isApi && interaction?.universityId && universityContacts.length === 0) {
+      void loadUniversityExtras(interaction.universityId)
+    }
+  }, [interaction?.universityId, universityContacts.length, loadUniversityExtras])
+
   const stages = useStages(interaction?.segment ?? "B2B")
   const visitTitle = interaction
     ? [interaction.universityShortName ?? interaction.counterpartyName, interaction.directionName].join(" · ")
@@ -252,6 +277,15 @@ export function InteractionDetailPage() {
     return result.ok
   }
 
+  const handleRemoveNote = async (noteId: string) => {
+    if (!window.confirm("Удалить заметку?")) return
+    const result = await removeNote(interaction.id, noteId)
+    if (result.ok) toast.success("Заметка удалена")
+    else toast.error("Не удалось удалить заметку", result.error)
+  }
+
+  const primaryUniversityContact = universityContacts.find((c) => c.isPrimary) ?? universityContacts[0]
+
   const infoCells: { label: string; value: React.ReactNode }[] = [
     { label: "Сегмент", value: interaction.segment },
     { label: "Этап", value: interaction.currentStateLabel },
@@ -290,7 +324,10 @@ export function InteractionDetailPage() {
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between gap-3">
-            <CardTitle className="text-base">Сведения</CardTitle>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Building2 className="size-4 text-sky-600 dark:text-sky-400" />
+              Сведения
+            </CardTitle>
             {isApi && canManage && employees.length > 0 && (
               <label className="flex items-center gap-2 text-xs text-muted-foreground">
                 Ответственный
@@ -335,67 +372,111 @@ export function InteractionDetailPage() {
 
       {/* Переходы по процессу (режим API): доступные из текущего этапа */}
       {isApi && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Следующий шаг</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {!detail && <p className="text-sm text-muted-foreground">Загрузка…</p>}
-            {detail && archived && (
-              <p className="text-sm text-muted-foreground">Архивное взаимодействие доступно только для чтения.</p>
-            )}
-            {detail && !archived && detail.availableTransitions.length === 0 && (
-              <p className="text-sm text-muted-foreground">
-                {currentStage?.isFinal ? "Процесс завершён." : "Из текущего этапа переходов нет."}
-              </p>
-            )}
-            {detail && !archived && detail.availableTransitions.length > 0 && (
-              <div className="flex flex-wrap gap-2">
-                {detail.availableTransitions.map((t) => (
-                  <Button
-                    key={t.toStateKey}
-                    variant={t.toStateKey === "REJECTED" ? "outline" : "default"}
-                    size="sm"
-                    disabled={!t.allowed}
-                    title={t.blockedReason ?? `→ ${t.toStateLabel}`}
-                    onClick={() => openTransition(t)}
-                  >
-                    {t.label}
-                  </Button>
-                ))}
-              </div>
-            )}
-            {detail && !archived &&
-              detail.availableTransitions
-                .filter((t) => !t.allowed && t.blockedReason)
-                .map((t) => (
-                  <p key={t.toStateKey} className="text-xs text-muted-foreground">
-                    «{t.label}»: {t.blockedReason}
-                  </p>
-                ))}
-            {detail && detail.history.length > 0 && (
-              <div className="border-t pt-3">
-                <div className="mb-2 text-xs font-medium text-muted-foreground">Журнал переходов</div>
-                <div className="max-h-48 space-y-2 overflow-y-auto pr-1">
-                  {detail.history.map((h) => (
-                    <div key={h.id} className="text-sm">
-                      <span className="text-muted-foreground">{formatDate(h.createdAt)} · {h.actorName}: </span>
-                      {h.fromStateLabel ? `${h.fromStateLabel} → ` : ""}
-                      {h.toStateLabel}
-                      {h.comment && <span className="text-muted-foreground"> — {h.comment}</span>}
-                    </div>
+        <>
+          {primaryUniversityContact && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <UserRound className="size-4 text-emerald-600 dark:text-emerald-400" />
+                  Контактное лицо вуза
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 text-sm">
+                <div className="font-medium text-foreground">{primaryUniversityContact.fullName}</div>
+                {(primaryUniversityContact.position || primaryUniversityContact.role) && (
+                  <div className="text-muted-foreground">
+                    {primaryUniversityContact.position ?? primaryUniversityContact.role}
+                    {primaryUniversityContact.role && primaryUniversityContact.position && ` · ${primaryUniversityContact.role}`}
+                  </div>
+                )}
+                {primaryUniversityContact.email && (
+                  <div>
+                    <span className="text-muted-foreground">Email: </span>
+                    <a href={`mailto:${primaryUniversityContact.email}`} className="text-primary underline-offset-2 hover:underline">
+                      {primaryUniversityContact.email}
+                    </a>
+                  </div>
+                )}
+                {primaryUniversityContact.phone && (
+                  <div>
+                    <span className="text-muted-foreground">Телефон: </span>
+                    <a href={`tel:${primaryUniversityContact.phone}`} className="text-primary underline-offset-2 hover:underline">
+                      {primaryUniversityContact.phone}
+                    </a>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <ArrowRight className="size-4 text-amber-600 dark:text-amber-400" />
+                Следующий шаг
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {!detail && <p className="text-sm text-muted-foreground">Загрузка…</p>}
+              {detail && archived && (
+                <p className="text-sm text-muted-foreground">Архивное взаимодействие доступно только для чтения.</p>
+              )}
+              {detail && !archived && detail.availableTransitions.length === 0 && (
+                <p className="text-sm text-muted-foreground">
+                  {currentStage?.isFinal ? "Процесс завершён." : "Из текущего этапа переходов нет."}
+                </p>
+              )}
+              {detail && !archived && detail.availableTransitions.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {detail.availableTransitions.map((t) => (
+                    <Button
+                      key={t.toStateKey}
+                      variant={t.toStateKey === "REJECTED" ? "outline" : "default"}
+                      size="sm"
+                      disabled={!t.allowed}
+                      title={t.blockedReason ?? `→ ${t.toStateLabel}`}
+                      onClick={() => openTransition(t)}
+                    >
+                      {t.label}
+                    </Button>
                   ))}
                 </div>
-              </div>
-            )}
-          </CardContent>
-        </Card>
+              )}
+              {detail && !archived &&
+                detail.availableTransitions
+                  .filter((t) => !t.allowed && t.blockedReason)
+                  .map((t) => (
+                    <p key={t.toStateKey} className="text-xs text-muted-foreground">
+                      «{t.label}»: {t.blockedReason}
+                    </p>
+                  ))}
+              {detail && detail.history.length > 0 && (
+                <div className="border-t pt-3">
+                  <div className="mb-2 text-xs font-medium text-muted-foreground">Журнал переходов</div>
+                  <div className="max-h-48 space-y-2 overflow-y-auto pr-1">
+                    {detail.history.map((h) => (
+                      <div key={h.id} className="text-sm">
+                        <span className="text-muted-foreground">{formatDate(h.createdAt)} · {h.actorName}: </span>
+                        {h.fromStateLabel ? `${h.fromStateLabel} → ` : ""}
+                        {h.toStateLabel}
+                        {h.comment && <span className="text-muted-foreground"> — {h.comment}</span>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </>
       )}
 
       {/* Флоу-канвас: готовый виджет StageCanvas */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Этапы флоу</CardTitle>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <GitBranch className="size-4 text-violet-600 dark:text-violet-400" />
+            Этапы флоу
+          </CardTitle>
         </CardHeader>
         <CardContent>
           <StageCanvas
@@ -408,7 +489,8 @@ export function InteractionDetailPage() {
       {/* Progress overview */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <Gauge className="size-4 text-blue-600 dark:text-blue-400" />
             Прогресс: {progress.pct}% ({progress.completed}/{progress.total} этапов)
           </CardTitle>
         </CardHeader>
@@ -433,7 +515,7 @@ export function InteractionDetailPage() {
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-base">
-                <Calendar className="size-4" />
+                <ListTodo className="size-4 text-orange-600 dark:text-orange-400" />
                 Задачи ({interTasks.length})
               </CardTitle>
             </CardHeader>
@@ -480,7 +562,7 @@ export function InteractionDetailPage() {
             <CardHeader>
               <div className="flex items-center justify-between">
                 <CardTitle className="flex items-center gap-2 text-base">
-                  <FileText className="size-4" />
+                  <FileText className="size-4 text-rose-600 dark:text-rose-400" />
                   Файлы ({interAttachments.length})
                 </CardTitle>
                 {!archived && (
@@ -575,7 +657,7 @@ export function InteractionDetailPage() {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
-            <ChartBubble className="size-4" />
+                <ChartBubble className="size-4 text-cyan-600 dark:text-cyan-400" />
             Активность
           </CardTitle>
         </CardHeader>
@@ -607,7 +689,10 @@ export function InteractionDetailPage() {
           <Card className="sticky top-6">
             <CardHeader>
               <div className="flex items-center justify-between">
-                <CardTitle className="text-base">Заметки по взаимодействию</CardTitle>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <MessageSquareText className="size-4 text-pink-600 dark:text-pink-400" />
+                  Заметки по взаимодействию
+                </CardTitle>
                 <Badge variant="secondary">{interNotes.length}</Badge>
               </div>
             </CardHeader>
@@ -617,15 +702,29 @@ export function InteractionDetailPage() {
                   <p className="text-sm text-muted-foreground">Заметок пока нет</p>
                 )}
                 {interNotes.map((n) => (
-                  <div key={n.id} className="rounded-lg border bg-muted/40 p-3">
-                    <div className="flex items-center justify-between gap-2 text-xs">
-                      <span className="font-medium">{n.author.name}</span>
-                      <span className="text-muted-foreground">{formatDateTime(n.createdAt)}</span>
+                  <div key={n.id} className="min-w-0 rounded-lg border bg-muted/40 p-3">
+                    <div className="flex items-start justify-between gap-2 text-xs">
+                      <div className="min-w-0 [overflow-wrap:anywhere]">
+                        <span className="font-medium">{n.author.name}</span>
+                        <span className="ml-2 text-muted-foreground">{formatDateTime(n.createdAt)}</span>
+                      </div>
+                      {n.canDelete && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-7 shrink-0 text-muted-foreground hover:text-destructive"
+                          onClick={() => void handleRemoveNote(n.id)}
+                          aria-label={`Удалить заметку ${n.author.name}`}
+                          title="Удалить заметку"
+                        >
+                          <Trash2 className="size-4" />
+                        </Button>
+                      )}
                     </div>
                     {n.stateLabel && (
                       <Badge variant="outline" className="mt-1.5 text-[10px]">{n.stateLabel}</Badge>
                     )}
-                    <p className="mt-1 whitespace-pre-wrap text-sm">{n.body}</p>
+                    <p className="mt-1 whitespace-pre-wrap text-sm [overflow-wrap:anywhere]">{n.body}</p>
                   </div>
                 ))}
               </div>

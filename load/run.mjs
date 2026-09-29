@@ -25,6 +25,7 @@
  *   node load/run.mjs --scenario mixed --users 100
  *   node load/run.mjs --scenario reports --users 10 --seconds 120
  *   node load/run.mjs --scenario login --users 10 --seconds 60
+ *   node load/run.mjs --scenario login --users 1 --account admin.sidorov
  *   … --out result.json --label "1 экземпляр" --monitor
  */
 import { fork, execFile } from 'node:child_process';
@@ -57,6 +58,11 @@ const ACCOUNTS = [
   { username: 'manager.petrov', password: 'Mgr#2026demo' },
   { username: 'admin.sidorov', password: 'Adm#2026demo' },
 ];
+/** --account логин: все сессии от одной учётной записи — например, вход одной роли без соседей. */
+const ONLY_ACCOUNT = ACCOUNTS.findIndex((a) => a.username === arg('account', null));
+if (arg('account', null) && ONLY_ACCOUNT < 0) {
+  throw new Error(`Неизвестная учётная запись: ${arg('account', null)}`);
+}
 
 // ---------------------------------------------------------------- замеры
 
@@ -452,8 +458,9 @@ async function main() {
 
   const sessions = Array.from({ length: USERS }, (_, index) => {
     // Отчёты формирует администратор — ему доступен весь объём; остальные
-    // сценарии идут от всех четырёх ролей по кругу.
-    const account = SCENARIO === 'reports' ? 3 : index % ACCOUNTS.length;
+    // сценарии идут от всех четырёх ролей по кругу, если --account не
+    // закрепляет за всеми сессиями одну учётную запись.
+    const account = ONLY_ACCOUNT >= 0 ? ONLY_ACCOUNT : SCENARIO === 'reports' ? 3 : index % ACCOUNTS.length;
     const role = ['КАМ', 'КАМ', 'руководитель', 'администратор'][account];
     return { token: tokens[account], ids: ids[account], reportVariants, role };
   });

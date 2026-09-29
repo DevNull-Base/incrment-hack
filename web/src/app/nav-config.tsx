@@ -100,7 +100,7 @@ const sections: NavSectionDef[] = [
       { to: "/admin/import", label: "Импорт данных" },
       { to: "/admin/integrations", label: "Интеграции" },
       { to: "/admin/persons", label: "Персоны (152-ФЗ)" },
-      { to: "/settings", label: "Настройки системы" },
+      { to: "/settings", label: "Настройки системы", end: true },
     ],
   },
 ]

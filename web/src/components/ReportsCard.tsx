@@ -245,7 +245,7 @@ export function ReportsCard() {
           </div>
           <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
             <span>
-              Под отбор попадает ≈ <span className="font-medium tabular-nums text-foreground">{estimate}</span> взаимодействий
+              Взаимодействий под отбором: ≈ <span className="font-medium tabular-nums text-foreground">{estimate}</span>
             </span>
             <button type="button" className="underline-offset-2 hover:underline" onClick={() => setBuilder((prev) => ({ ...prev, filters: EMPTY_FILTERS }))}>
               Сбросить отбор

@@ -209,7 +209,7 @@ function DropdownPanel({ section, isOpen, onClose, side, onPageSelect, activePat
 
       <div className="p-1.5 transition-opacity duration-150 group-data-[open=true]:duration-0 group-data-[open=false]:opacity-0">
         {section.items.map((item) => {
-          const isActivePage = isNavItemActive(currentPath, item.to)
+          const isActivePage = isNavItemActive(currentPath, item.to, item.end)
           return (
             <button
               key={item.to}
@@ -249,8 +249,9 @@ interface SidebarV2Props {
   narrow?: boolean
 }
 
-function isNavItemActive(currentPath: string, itemTo: string): boolean {
+function isNavItemActive(currentPath: string, itemTo: string, end = false): boolean {
   if (itemTo === "/") return currentPath === "/"
+  if (end) return currentPath === itemTo
   return currentPath === itemTo || currentPath.startsWith(`${itemTo}/`)
 }
 
@@ -344,7 +345,7 @@ export function SidebarV2({ side, onPageSelect, hidden, activePath, narrow }: Si
       <aside className="relative z-20 flex h-full w-[52px] flex-col bg-card/50 border-r border-border/60 shrink-0">
         <nav className="flex-1 flex flex-col gap-1 p-1 pt-2">
           {sections.map((section, sectionIndex) => {
-            const hasActiveItem = section.items.some((item) => isNavItemActive(currentPath, item.to))
+            const hasActiveItem = section.items.some((item) => isNavItemActive(currentPath, item.to, item.end))
             return (
             <div
               key={section.title}
@@ -417,12 +418,12 @@ export function SidebarV2({ side, onPageSelect, hidden, activePath, narrow }: Si
               {/* Пункты меню */}
               <div className="flex flex-col gap-0.5">
                 {section.items.map((item) => {
-                  const isActiveItem = isNavItemActive(currentPath, item.to)
+                  const isActiveItem = isNavItemActive(currentPath, item.to, item.end)
                   return (
                     <NavLink
                       key={item.to}
                       to={item.to}
-                      end={item.to === "/"}
+                      end={item.end || item.to === "/"}
                       onClick={(e) => {
                         if (onPageSelect) {
                           e.preventDefault()

@@ -78,6 +78,22 @@ async function scrollContentTo(page, locator) {
   await page.waitForTimeout(300)
 }
 
+/**
+ * Поставить блок в верх области содержимого — даже если он уже виден:
+ * иначе снимок нижней части страницы совпал бы со снимком её начала.
+ */
+async function scrollContentToTop(page, locator) {
+  // Прокрутка мгновенная: в интерфейсе включена плавная, и второй вызов
+  // прервал бы первый.
+  await locator.evaluate((element) => {
+    element.scrollIntoView({ block: "start", behavior: "instant" })
+    let parent = element.parentElement
+    while (parent && parent.scrollHeight <= parent.clientHeight) parent = parent.parentElement
+    parent?.scrollBy({ top: -24, behavior: "instant" })
+  })
+  await page.waitForTimeout(300)
+}
+
 async function login(context, account) {
   const page = await context.newPage()
   await page.goto(`${BASE}/login`)
@@ -101,16 +117,17 @@ async function newContext(browser) {
 async function managerShots(browser) {
   const context = await newContext(browser)
 
-  // Экран входа почти пуст — снимается область вокруг формы.
+  // Экран входа почти пуст — снимается область вокруг формы вместе с логотипом.
   const loginPage = await context.newPage()
   await open(loginPage, "/login")
-  const heading = await loginPage.getByText("Вход в систему").boundingBox()
-  const button = await loginPage.getByRole("button", { name: "Войти" }).boundingBox()
-  if (heading && button) {
-    const x = Math.min(heading.x, button.x) - 60
-    const y = heading.y - 90
+  const form = await loginPage
+    .getByText("Вход в систему")
+    .locator("xpath=ancestor::div[contains(@class,'max-w-')][1]")
+    .boundingBox()
+  if (form) {
+    const pad = 60
     await save(loginPage, "login", {
-      clip: { x, y, width: Math.max(heading.width, button.width) + 120, height: button.y + button.height + 60 - y },
+      clip: { x: form.x - pad, y: form.y - pad, width: form.width + 2 * pad, height: form.height + 2 * pad },
     })
   } else {
     await save(loginPage, "login")
@@ -154,8 +171,24 @@ async function managerShots(browser) {
   await save(meetingsCard, "meetings")
   await page.getByRole("button", { name: "Назначить встречу" }).click()
   await page.waitForTimeout(400)
+  // Фокус в поле даты выделяет его — на снимке это выглядит как ошибка.
+  await page.evaluate(() => document.activeElement?.blur())
   await save(page.getByRole("dialog"), "meeting-dialog")
   await page.keyboard.press("Escape")
+
+  // Разделение экрана: слева карточка взаимодействия, справа страница её вуза.
+  // Панели задаются адресом, как после выбора страниц вручную.
+  const cardId = withNotes[0]?.id
+  const card = cardId ? await apiGet(page, `/engagements/${cardId}`) : null
+  if (card?.universityId) {
+    const panels = new URLSearchParams({ l: `/interactions/${cardId}`, r: `/universities/${card.universityId}`, s: "right" })
+    await open(page, `/interactions/${cardId}?${panels}`)
+    await page.mouse.move(5, 5)
+    await page.waitForTimeout(600)
+    await save(page, "split-screen")
+    await page.getByRole("button", { name: "Разделение экрана" }).click()
+    await settle(page)
+  }
 
   // Страница вуза: договоры, потоки, заметки по вузу.
   await search.click()
@@ -165,7 +198,8 @@ async function managerShots(browser) {
   await settle(page)
   await scrollContentTo(page, page.getByRole("heading", { level: 1 }))
   await save(page, "university-card")
-  await scrollContentTo(page, page.getByText(/^Потоки \(\d+\)$/))
+  const contracts = page.locator("[data-slot='card']", { has: page.getByText(/^Договоры и лицензии \(\d+\)$/) })
+  await scrollContentToTop(page, (await contracts.count()) ? contracts.first() : page.getByText(/^Потоки \(\d+\)$/))
   await save(page, "university-streams")
 
   await open(page, "/programs")
@@ -182,7 +216,10 @@ async function managerShots(browser) {
   await page.getByPlaceholder("Найти…").fill("МГТУ")
   await page.locator("label", { hasText: "МГТУ им. Баумана" }).locator("input").check()
   await page.keyboard.press("Escape")
+  // Формат книги 97-2003 — так подписан снимок в руководстве.
+  await report.getByRole("button", { name: "XLS", exact: true }).click()
   await save((await report.count()) ? report : page, "reports")
+  await report.getByRole("button", { name: "XLSX", exact: true }).click()
   await page.getByRole("button", { name: "Сбросить отбор" }).click()
 
   // Региональная аналитика: карта по числу обучающихся. Снимается сама

@@ -11,7 +11,17 @@ import { selectWorkingInteractions } from "@/app/store/selectors"
 import { ROLE_LABELS } from "@/shared/lib/roles"
 import { cn } from "@/shared/lib/utils"
 import type { Segment } from "@/shared/api"
-import { ArrowRight, ChevronDown, ChevronUp, Clock, FileText, MessageSquare } from "lucide-react"
+import {
+  ArrowRight,
+  ChevronDown,
+  ChevronUp,
+  CircleUserRound,
+  Clock,
+  FileText,
+  GitBranch,
+  MessageSquare,
+  Workflow as WorkflowIcon,
+} from "lucide-react"
 
 const SEGMENT_LABELS: Record<Segment, string> = {
   B2B: "Вузы · B2B",
@@ -91,7 +101,10 @@ export function WorkflowPage() {
       {path.length > 0 && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Маршрут</CardTitle>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <GitBranch className="size-4 text-violet-600 dark:text-violet-400" />
+              Маршрут
+            </CardTitle>
           </CardHeader>
           <CardContent>
             <div className="flex flex-wrap items-center gap-2">
@@ -115,7 +128,8 @@ export function WorkflowPage() {
       {example && exampleProgress && (
         <Card className="border-primary/20 bg-primary/5">
           <CardHeader>
-            <CardTitle className="text-base">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <CircleUserRound className="size-4 text-emerald-600 dark:text-emerald-400" />
               Пример: {example.universityShortName ?? example.universityName ?? example.counterpartyName}
             </CardTitle>
           </CardHeader>
@@ -162,7 +176,17 @@ export function WorkflowPage() {
                   </div>
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
-                      <CardTitle className="text-base">{stage.label}</CardTitle>
+                      <CardTitle className="flex items-center gap-2 text-base">
+                        <WorkflowIcon className={cn(
+                          "size-4",
+                          stage.isRejected
+                            ? "text-slate-500 dark:text-slate-400"
+                            : stage.isFinal
+                              ? "text-emerald-600 dark:text-emerald-400"
+                              : "text-blue-600 dark:text-blue-400",
+                        )} />
+                        {stage.label}
+                      </CardTitle>
                       {stage.isRejected && <Badge variant="secondary">Отказ</Badge>}
                       {stage.isFinal && !stage.isRejected && <Badge variant="outline">Итог</Badge>}
                       {stage.requiresAttachment && (
